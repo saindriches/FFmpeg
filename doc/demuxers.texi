@@ -834,6 +834,10 @@ Set the sample rate for libopenmpt to output.
 Range is from 1000 to INT_MAX. The value default is 48000.
 @end table
 
+@section mmttlv
+
+Demuxer for MMT protocol over TLV packets (MMT/TLV), as defined in ARIB STD-B32.
+
 @anchor{mccdec}
 @section mcc
 
