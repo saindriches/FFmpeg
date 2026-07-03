@@ -1364,10 +1364,10 @@ static int emit_closed_caption_mfu(MMTPContext *ctx, struct Streams *st,
 static int
 emit_packet(MMTPContext *ctx, struct Streams *st, uint8_t *data, int size)
 {
-    int      err;
-    int      consumed;
-    uint8_t *out_data = NULL;
-    int      out_size = 0;
+    int           err;
+    int           consumed;
+    const uint8_t *out_data = NULL;
+    int           out_size  = 0;
 
     if (st->parser == NULL) {
         st->parser = av_parser_init(st->stream->codecpar->codec_id);
@@ -1383,15 +1383,16 @@ emit_packet(MMTPContext *ctx, struct Streams *st, uint8_t *data, int size)
             st->parser->pos             = st->offset;
             // use last_pos to store flags
             st->parser->last_pos        = st->flags;
+            // clear only after handing them over; parse_mpu sets the next AU's
+            // offset before the parser reaches this frame boundary
+            st->offset = -1;
+            st->flags  = 0;
         }
-        st->offset = -1;
-        st->flags  = 0;
 
-        consumed = av_parser_parse2(
+        consumed = st->parser->parser->parser_parse(
             st->parser, ffstream(st->stream)->avctx,
             &out_data, &out_size,
-            data, size,
-            AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0
+            data, size
         );
         size -= consumed;
 
