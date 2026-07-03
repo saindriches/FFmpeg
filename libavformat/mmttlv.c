@@ -162,12 +162,18 @@ static int mmttlv_read_compressed_ip_packet(
 
     if (program == NULL) {
         AVProgram *p = av_new_program(s, context_id);
-        if (p == NULL) return AVERROR(errno);
+        if (p == NULL) return AVERROR(ENOMEM);
 
         program = av_malloc(sizeof(struct Program));
-        if (program == NULL) return AVERROR(errno);
+        if (program == NULL) return AVERROR(ENOMEM);
 
+        // av_malloc does not set errno; and an unchecked NULL mmtp would be dereferenced by
+        // ff_mmtp_parse_packet below.
         program->mmtp = ff_mmtp_parse_open(p);
+        if (program->mmtp == NULL) {
+            av_free(program);
+            return AVERROR(ENOMEM);
+        }
         program->next = ctx->programs;
         ctx->programs = program;
         program->cid  = context_id;
@@ -268,9 +274,13 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     if (ctx->cap < size) {
-        av_free(ctx->buf);
-        if ((ctx->buf = av_malloc(ctx->cap = size)) == NULL)
-            return AVERROR(errno);
+        // Reset cap to 0 before allocating: on failure buf is NULL, and a stale cap == size would
+        // make a later call skip the realloc and read into NULL.
+        av_freep(&ctx->buf);
+        ctx->cap = 0;
+        if ((ctx->buf = av_malloc(size)) == NULL)
+            return AVERROR(ENOMEM);
+        ctx->cap = size;
     }
     if ((err = ffio_read_size(s->pb, ctx->buf, size)) < 0)
         return avio_feof(s->pb) ? AVERROR_EOF : err;

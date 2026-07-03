@@ -1400,7 +1400,14 @@ emit_packet(MMTPContext *ctx, struct Streams *st, uint8_t *data, int size)
         }
         st->parser->fetch_timestamp = true;
 
-        av_assert0(ctx->pkt->data == NULL);
+        // An MFU carries a single access unit, so the parser should yield one frame per read; if a
+        // non-conformant MFU yields more, keep the first and warn rather than aborting on an assert.
+        if (ctx->pkt->data != NULL) {
+            av_log(ctx->s, AV_LOG_WARNING,
+                   "pid 0x%04x: parser produced more than one frame for a single MFU; "
+                   "dropping the extra frame\n", ctx->current_pid);
+            break;
+        }
         ctx->pkt->data = (uint8_t *) out_data;
         ctx->pkt->size = out_size;
 
@@ -1430,22 +1437,28 @@ static int consume_mfu(MMTPContext *ctx, GetByteContext *gbc)
     case AV_CODEC_ID_HEVC:
         size = bytestream2_get_be32(gbc);
         if (size != bytestream2_get_bytes_left(gbc)) return AVERROR_INVALIDDATA;
-        if ((buf = av_malloc(size + 3)) == NULL) return AVERROR(ENOMEM);
+        // ff_combine_frame reads AV_INPUT_BUFFER_PADDING_SIZE bytes past the data, so allocate
+        // and zero that padding; otherwise it reads adjacent heap.
+        if ((buf = av_malloc(size + 3 + AV_INPUT_BUFFER_PADDING_SIZE)) == NULL)
+            return AVERROR(ENOMEM);
         buf[0] = 0x00;
         buf[1] = 0x00;
         buf[2] = 0x01;
         bytestream2_get_bufferu(gbc, buf + 3, size);
+        memset(buf + 3 + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         err = emit_packet(ctx, st, buf, size + 3);
         av_free(buf);
         return err;
     case AV_CODEC_ID_AAC_LATM:
         size = bytestream2_get_bytes_left(gbc);
         if (size >> 13) return AVERROR(EOVERFLOW);
-        if ((buf = av_malloc(size + 3)) == NULL) return AVERROR(ENOMEM);
+        if ((buf = av_malloc(size + 3 + AV_INPUT_BUFFER_PADDING_SIZE)) == NULL)
+            return AVERROR(ENOMEM);
         buf[0] = 0x56;
         buf[1] = 0xe0 | (size >> 8);
         buf[2] = size & 0xff;
         bytestream2_get_bufferu(gbc, buf + 3, size);
+        memset(buf + 3 + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         err = emit_packet(ctx, st, buf, size + 3);
         av_free(buf);
         return err;
