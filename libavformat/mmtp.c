@@ -28,7 +28,7 @@
 #include "demux.h"
 #include "internal.h"
 #include "mmtp.h"
-#include <netinet/in.h>
+#include "network.h"
 
 struct MMTGeneralLocationInfo {
     uint8_t location_type;
