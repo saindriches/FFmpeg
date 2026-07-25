@@ -101,6 +101,7 @@ struct MMTTLVContext {
 
     int64_t last_pos;
     size_t  resync_size;
+    int     resync_fails;   // consecutive exhausted hunts; bounds the REDO retries
 
     size_t  cap;
     uint8_t *buf;
@@ -198,6 +199,16 @@ static int mmttlv_read_compressed_ip_packet(
     return ff_mmtp_parse_packet(program->mmtp, s, pkt, buf, size);
 }
 
+// 0x7F occurs freely inside coded payloads (HEVC hits it often); a resync candidate must
+// also carry a defined packet_type or the hunt latches onto false headers and the parser
+// then reads garbage — which surfaces as nonsense timestamps and defeats the seek search.
+static int mmttlv_valid_type(uint8_t t)
+{
+    return t == IPV4_PACKET || t == IPV6_PACKET ||
+           t == HEADER_COMPRESSED_IP_PACKET ||
+           t == TRANSMISSION_CONTROL_PACKET || t == NULL_PACKET;
+}
+
 static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     uint8_t              header[4];
@@ -222,7 +233,7 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
             if ((err = avio_read(s->pb, header, 4)) != 4)
                 return (err < 0 && !avio_feof(s->pb)) ? err : AVERROR_EOF;
 
-            if (header[0] != HEADER_BYTE) {
+            if (header[0] != HEADER_BYTE || !mmttlv_valid_type(header[1])) {
                 if ((pos = avio_seek(s->pb, -3, SEEK_CUR)) < 0)
                     return (int) pos;
                 continue;
@@ -254,9 +265,15 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
                 s->pb, -(int64_t) (size) - 1 - 3, SEEK_CUR)) < 0)
                 return (int) pos;
         }
+        // Window exhausted. The position has advanced by the whole hunt, so retrying makes
+        // progress; a hard error here lets a caller's error cap turn one bad landing into EOF
+        // (mpv treats ~10 consecutive errors as fatal). Bounded by the give-up below.
+        if (++ctx->resync_fails <= 32)
+            return FFERROR_REDO;
         return AVERROR_INVALIDDATA;
 
         success:
+        ctx->resync_fails = 0;
         ctx->last_pos = pos;
 
         for (struct Program *program = ctx->programs;
@@ -402,7 +419,8 @@ static int mmttlv_read_header(AVFormatContext *s)
         return (int) ctx->last_pos;
     ctx->last_pos -= 1; // force resync
 
-    ctx->resync_size = 4096;
+    ctx->resync_size  = 4096;
+    ctx->resync_fails = 0;
     ctx->first_pts   = AV_NOPTS_VALUE;
     s->ctx_flags |= AVFMTCTX_NOHEADER;
 
@@ -553,6 +571,24 @@ static int64_t mmttlv_read_timestamp(
     return result;
 }
 
+// The binary search lands blind: the chosen byte offset can sit inside a max-size video TLV
+// packet, so reset the parser and widen the resync hunt enough to reach the next packet
+// boundary (the default 4 KB window cannot escape a 64 KB packet).
+static int mmttlv_read_seek(AVFormatContext *s, int stream_index,
+                           int64_t target_ts, int flags)
+{
+    struct MMTTLVContext *ctx = s->priv_data;
+    const int ret = ff_seek_frame_binary(s, stream_index, target_ts, flags);
+
+    if (ret < 0)
+        return ret;
+
+    ctx->last_pos     = -1; // force resync + state reset at the new position
+    ctx->resync_size  = 65536 + 4096;
+    ctx->resync_fails = 0;
+    return 0;
+}
+
 #if CONFIG_MMTTLV_DEMUXER
 const FFInputFormat ff_mmttlv_demuxer = {
     .p.name         = "mmttlv",
@@ -566,6 +602,6 @@ const FFInputFormat ff_mmttlv_demuxer = {
     .read_packet    = mmttlv_read_packet,
     .read_close     = mmttlv_read_close,
     .read_timestamp = mmttlv_read_timestamp,
-    .read_seek      = ff_seek_frame_binary,
+    .read_seek      = mmttlv_read_seek,
 };
 #endif
