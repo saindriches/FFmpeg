@@ -217,8 +217,10 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
             if ((err = ffio_ensure_seekback(s->pb, 4)) < 0)
                 return err;
 
-            if ((err = avio_read(s->pb, header, 4)) < 0)
-                return avio_feof(s->pb) ? AVERROR_EOF : err;
+            // A short read is not an error from avio_read, but there is no whole TLV header
+            // left — report EOF instead of scanning on with stale `header` bytes.
+            if ((err = avio_read(s->pb, header, 4)) != 4)
+                return (err < 0 && !avio_feof(s->pb)) ? err : AVERROR_EOF;
 
             if (header[0] != HEADER_BYTE) {
                 if ((pos = avio_seek(s->pb, -3, SEEK_CUR)) < 0)
@@ -237,8 +239,8 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
             if ((pos = avio_skip(s->pb, 4 + size)) < 0)
                 return (int) pos;
 
-            if ((err = avio_read(s->pb, header, 1)) < 0)
-                return avio_feof(s->pb) ? AVERROR_EOF : err;
+            if ((err = avio_read(s->pb, header, 1)) != 1)
+                return (err < 0 && !avio_feof(s->pb)) ? err : AVERROR_EOF;
 
             if (header[0] == HEADER_BYTE) {
                 // found HEADER, [size], HEADER, should be good
