@@ -486,6 +486,11 @@ static int mmttlv_read_close(AVFormatContext *ctx)
 // A probe may land inside a large HEVC access unit, so widen the resync window (a
 // video TLV fragment can exceed the default), reset state on entry so probes are
 // independent, and skip past a failed resync rather than failing the whole seek.
+//
+// pos_limit is an ABSOLUTE file position, not a byte budget: ff_find_last_ts() probes
+// the tail with a small window ([filesize-1-step, filesize-1], step doubling until a
+// timestamp turns up) and ff_gen_search() passes INT64_MAX. Stop as soon as the scan
+// reaches it and report "nothing here", so the caller can widen its own window.
 static int64_t mmttlv_read_timestamp(
     struct AVFormatContext *s, int stream_index,
     int64_t *pos, int64_t pos_limit)
@@ -499,8 +504,9 @@ static int64_t mmttlv_read_timestamp(
     ctx->resync_size = 65536 + 4096;
     ctx->last_pos    = -1; // force a clean resync + state reset at the probe
 
-    while (pos_limit > 0) {
+    while (*pos < pos_limit) {
         AVPacket      packet = {0};
+        const int64_t prev   = *pos;
         const int     err    = mmttlv_read_packet(s, &packet);
         const int64_t ts     = packet.dts;
         const int64_t off    = packet.pos;
@@ -518,20 +524,29 @@ static int64_t mmttlv_read_timestamp(
         }
 
         if (err < 0 && err != FFERROR_REDO) {
-            // bad sync — advance one byte and resync again, staying in budget
+            // bad sync — advance one byte and resync again
             const int64_t here = avio_tell(s->pb);
             if (here < 0)
                 break;
-            pos_limit -= (here + 1) - *pos;
-            *pos          = here + 1;
+            *pos = here + 1;
             if (avio_seek(s->pb, *pos, SEEK_SET) < 0)
                 break;
             ctx->last_pos = -1;
             continue;
         }
 
-        pos_limit -= ctx->last_pos - *pos;
+        // Keep reading sequentially from here: the MMTP parser needs consecutive packets to
+        // finish assembling an MPU, so re-seeking (and resetting its state) per iteration
+        // would keep discarding the access unit we are waiting for.
         *pos = ctx->last_pos;
+
+        // Never stall: a packet that consumed nothing would otherwise spin here forever.
+        if (*pos <= prev) {
+            *pos = prev + 1;
+            if (avio_seek(s->pb, *pos, SEEK_SET) < 0)
+                break;
+            ctx->last_pos = -1;
+        }
     }
 
     ctx->resync_size = saved_resync;
