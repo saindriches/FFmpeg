@@ -395,7 +395,8 @@ void ff_cavs_modify_mb_i(AVSContext *h, int *pred_mode_uv)
  *
  ****************************************************************************/
 
-static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int chroma_height,
+static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int parity,
+                               int chroma_height,
                                int list, uint8_t *dest_y,
                                uint8_t *dest_cb, uint8_t *dest_cr,
                                int src_x_offset, int src_y_offset,
@@ -405,19 +406,26 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int chroma_height,
     const int mx         = mv->x + src_x_offset * 8;
     const int my         = mv->y + src_y_offset * 8;
     const int luma_xy    = (mx & 3) + ((my & 3) << 2);
-    uint8_t *src_y       = pic->data[0] + (mx >> 2) + (my >> 2) * h->l_stride;
-    uint8_t *src_cb      = pic->data[1] + (mx >> 3) + (my >> 3) * h->c_stride;
-    uint8_t *src_cr      = pic->data[2] + (mx >> 3) + (my >> 3) * h->c_stride;
+    uint8_t *src_y, *src_cb, *src_cr;
     int extra_width      = 0;
     int extra_height     = extra_width;
     const int full_mx    = mx >> 2;
     const int full_my    = my >> 2;
     const int pic_width  = 16 * h->mb_width;
-    const int pic_height = 16 * h->mb_height;
+    /* motion vectors address a field in quarter field lines (9.9.2.1) */
+    const int pic_height = h->pic_structure ? 16 * h->mb_height
+                                            :  8 * h->mb_height;
     int emu = 0;
 
     if (!pic->data[0])
         return;
+    src_y  = pic->data[0] + parity * pic->linesize[0] +
+             (mx >> 2) + (my >> 2) * h->l_stride;
+    src_cb = pic->data[1] + parity * pic->linesize[1] +
+             (mx >> 3) + (my >> 3) * h->c_stride;
+    src_cr = pic->data[2] + parity * pic->linesize[2] +
+             (mx >> 3) + (my >> 3) * h->c_stride;
+
     if (mx & 7)
         extra_width  -= 3;
     if (my & 7)
@@ -479,11 +487,12 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
     dest_cb  += x_offset     + y_offset * h->c_stride;
     dest_cr  += x_offset     + y_offset * h->c_stride;
     x_offset += 8 * h->mbx;
-    y_offset += 8 * h->mby;
+    /* the row is counted inside the current field (clause 3.24) */
+    y_offset += 8 * h->field_mby;
 
     if (mv->ref >= 0) {
-        AVFrame *ref = h->DPB[mv->ref].f;
-        mc_dir_part(h, ref, chroma_height, 0,
+        mc_dir_part(h, h->ref[mv->ref].f, h->ref[mv->ref].parity,
+                    chroma_height, 0,
                     dest_y, dest_cb, dest_cr, x_offset, y_offset,
                     qpix_op, chroma_op, mv);
 
@@ -492,8 +501,8 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
     }
 
     if ((mv + MV_BWD_OFFS)->ref >= 0) {
-        AVFrame *ref = h->DPB[0].f;
-        mc_dir_part(h, ref, chroma_height, 1,
+        /* the backward reference of a B frame picture is DPB[0] */
+        mc_dir_part(h, h->DPB[0].f, 0, chroma_height, 1,
                     dest_y, dest_cb, dest_cr, x_offset, y_offset,
                     qpix_op, chroma_op, mv + MV_BWD_OFFS);
     }
@@ -620,8 +629,21 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
         mv_pred_median(h, mvP, mvA, mvB, mvC);
 
     if (mode < MV_PRED_PSKIP) {
-        int mx = get_se_golomb(&h->gb) + (unsigned)mvP->x;
-        int my = get_se_golomb(&h->gb) + (unsigned)mvP->y;
+        int dx, dy, mx, my;
+
+        /* under AEC the caller has already decoded mv_diff into the
+         * cache (see aec_mv() in cavsdec.c) */
+        if (h->aec_enable) {
+            dx = h->mvd[nP][0];
+            dy = h->mvd[nP][1];
+        } else {
+            dx = get_se_golomb(&h->gb);
+            dy = get_se_golomb(&h->gb);
+            h->mvd[nP][0] = dx;
+            h->mvd[nP][1] = dy;
+        }
+        mx = dx + (unsigned)mvP->x;
+        my = dy + (unsigned)mvP->y;
 
         if (mx != (int16_t)mx || my != (int16_t)my) {
             av_log(h->avctx, AV_LOG_ERROR, "MV %d %d out of supported range\n", mx, my);
@@ -629,6 +651,7 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
             mvP->x = mx;
             mvP->y = my;
         }
+        set_mvds(&h->mvd[nP], size);
     }
     set_mvs(mvP, size);
 }
@@ -640,12 +663,39 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
  ****************************************************************************/
 
 /**
+ * Point the macroblock sample pointers at macroblock row h->mby: a
+ * macroblock is addressed inside its own field, from the field's first
+ * line, at the doubled stride (clauses 3.24, 7.2.3.1).
+ */
+void ff_cavs_set_mb_row(AVSContext *h)
+{
+    int parity = 0;
+
+    h->field     = !h->pic_structure && h->mby >= h->mb_height / 2;
+    h->field_mby = h->mby - h->field * (h->mb_height / 2);
+    if (!h->pic_structure)
+        parity = h->field ^ !h->top_field_first;
+
+    h->cy = h->cur.f->data[0] + parity * h->cur.f->linesize[0] +
+            h->field_mby * 16 * h->l_stride;
+    h->cu = h->cur.f->data[1] + parity * h->cur.f->linesize[1] +
+            h->field_mby *  8 * h->c_stride;
+    h->cv = h->cur.f->data[2] + parity * h->cur.f->linesize[2] +
+            h->field_mby *  8 * h->c_stride;
+}
+
+/**
  * initialise predictors for motion vectors and intra prediction
  */
 void ff_cavs_init_mb(AVSContext *h)
 {
     int i;
 
+    /* a macroblock has no mv_diff until one is decoded for it */
+    memset(h->mvd[MV_FWD_X0], 0, 2 * sizeof(*h->mvd));
+    memset(h->mvd[MV_FWD_X2], 0, 2 * sizeof(*h->mvd));
+    memset(h->mvd[MV_BWD_X0], 0, 2 * sizeof(*h->mvd));
+    memset(h->mvd[MV_BWD_X2], 0, 2 * sizeof(*h->mvd));
     /* copy predictors from top line (MB B and C) into cache */
     for (i = 0; i < 3; i++) {
         h->mv[MV_FWD_B2 + i] = h->top_mv[0][h->mbx * 2 + i];
@@ -692,8 +742,10 @@ int ff_cavs_next_mb(AVSContext *h)
     h->cu    += 8;
     h->cv    += 8;
     /* copy mvs as predictors to the left */
-    for (i = 0; i <= 20; i += 4)
+    for (i = 0; i <= 20; i += 4) {
         h->mv[i] = h->mv[i + 2];
+        memcpy(h->mvd[i], h->mvd[i + 2], sizeof(*h->mvd));
+    }
     /* copy bottom mvs from cache to top line */
     h->top_mv[0][h->mbx * 2 + 0] = h->mv[MV_FWD_X2];
     h->top_mv[0][h->mbx * 2 + 1] = h->mv[MV_FWD_X3];
@@ -707,17 +759,17 @@ int ff_cavs_next_mb(AVSContext *h)
         /* clear left pred_modes */
         h->pred_mode_Y[3] = h->pred_mode_Y[6] = NOT_AVAIL;
         /* clear left mv predictors */
-        for (i = 0; i <= 20; i += 4)
+        for (i = 0; i <= 20; i += 4) {
             h->mv[i] = un_mv;
+            memset(h->mvd[i], 0, sizeof(*h->mvd));
+        }
         h->mbx = 0;
         h->mby++;
-        /* re-calculate sample pointers */
-        h->cy = h->cur.f->data[0] + h->mby * 16 * h->l_stride;
-        h->cu = h->cur.f->data[1] + h->mby * 8 * h->c_stride;
-        h->cv = h->cur.f->data[2] + h->mby * 8 * h->c_stride;
         if (h->mby == h->mb_height) { // Frame end
             return 0;
         }
+        /* re-calculate sample pointers */
+        ff_cavs_set_mb_row(h);
     }
     return 1;
 }
@@ -733,22 +785,23 @@ int ff_cavs_init_pic(AVSContext *h)
     int i;
 
     /* clear some predictors */
-    for (i = 0; i <= 20; i += 4)
+    for (i = 0; i <= 20; i += 4) {
         h->mv[i] = un_mv;
+        memset(h->mvd[i], 0, sizeof(*h->mvd));
+    }
     h->mv[MV_BWD_X0] = ff_cavs_dir_mv;
     set_mvs(&h->mv[MV_BWD_X0], BLK_16X16);
     h->mv[MV_FWD_X0] = ff_cavs_dir_mv;
     set_mvs(&h->mv[MV_FWD_X0], BLK_16X16);
     h->pred_mode_Y[3] = h->pred_mode_Y[6] = NOT_AVAIL;
-    h->cy             = h->cur.f->data[0];
-    h->cu             = h->cur.f->data[1];
-    h->cv             = h->cur.f->data[2];
-    h->l_stride       = h->cur.f->linesize[0];
-    h->c_stride       = h->cur.f->linesize[1];
+    /* a field is every other line of the frame (clause 6.1.2) */
+    h->l_stride       = h->cur.f->linesize[0] << !h->pic_structure;
+    h->c_stride       = h->cur.f->linesize[1] << !h->pic_structure;
     h->luma_scan[2]   = 8 * h->l_stride;
     h->luma_scan[3]   = 8 * h->l_stride + 8;
     h->mbx            = h->mby = h->mbidx = 0;
     h->flags          = 0;
+    ff_cavs_set_mb_row(h);
 
     return 0;
 }

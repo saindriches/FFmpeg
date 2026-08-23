@@ -24,6 +24,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "libavutil/frame.h"
 #include "libavutil/mem_internal.h"
@@ -176,6 +177,12 @@ typedef struct AVSContext {
     GetBitContext gb;
     AVSFrame cur;     ///< currently decoded frame
     AVSFrame DPB[2];  ///< reference frames
+    /** The forward reference of every reference index, cl. 9.4.5: a frame,
+       or the field of one starting at parity. */
+    struct {
+        AVFrame *f;   ///< frame the reference belongs to
+        int parity;   ///< first line of the reference field inside it
+    } ref[4];
     int dist[2];     ///< temporal distances from current frame to ref frames
     int low_delay;
     int progressive_seq;
@@ -186,6 +193,10 @@ typedef struct AVSContext {
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
     int progressive;
     int pic_structure;
+    int top_field_first; ///< the first coded field is the top one, cl. 7.2.3
+    /** the coded field the current macroblock belongs to, 0 or 1, cl. 3.24 */
+    int field;
+    int field_mby;      ///< macroblock row of the current macroblock in it
     int skip_mode_flag; ///< select between skip_count or one skip_flag per MB
     int aec_enable;     ///< AVS1-P16 arithmetic coding of the macroblock layer
     CAVSAECContext aec; ///< AEC engine and context models, cl. 8.4
@@ -219,6 +230,8 @@ typedef struct AVSContext {
 
        the same is repeated for backward motion vectors */
     DECLARE_ALIGNED(8, cavs_vector, mv)[2*4*3];
+    /** mv_diff of the same blocks, for the ctxIdxInc of cl. 8.4.4.2 g) */
+    int16_t mvd[2*4*3][2];
     cavs_vector *top_mv[2];
     cavs_vector *col_mv;
 
@@ -290,6 +303,21 @@ static inline void set_mvs(cavs_vector *mv, enum cavs_block size) {
     }
 }
 
+/** replicate one partition's mv_diff over the 8x8 blocks it covers */
+static inline void set_mvds(int16_t (*mvd)[2], enum cavs_block size) {
+    switch(size) {
+    case BLK_16X16:
+        memcpy(mvd[MV_STRIDE  ], mvd[0], sizeof(*mvd));
+        memcpy(mvd[MV_STRIDE+1], mvd[0], sizeof(*mvd));
+    case BLK_16X8:
+        memcpy(mvd[1], mvd[0], sizeof(*mvd));
+        break;
+    case BLK_8X16:
+        memcpy(mvd[MV_STRIDE], mvd[0], sizeof(*mvd));
+        break;
+    }
+}
+
 void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_load_intra_pred_luma(AVSContext *h, uint8_t *top, uint8_t **left,
                                   int block);
@@ -299,6 +327,7 @@ void ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
                 enum cavs_mv_pred mode, enum cavs_block size, int ref);
 void ff_cavs_init_mb(AVSContext *h);
+void ff_cavs_set_mb_row(AVSContext *h);
 int  ff_cavs_next_mb(AVSContext *h);
 int ff_cavs_init_pic(AVSContext *h);
 int ff_cavs_init_top_lines(AVSContext *h);
