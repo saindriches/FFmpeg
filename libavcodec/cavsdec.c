@@ -1193,6 +1193,7 @@ static int decode_seq_header(AVSContext *h)
 {
     int frame_rate_code;
     int width, height;
+    int mb_width, mb_height;
     int ret;
 
     h->profile = get_bits(&h->gb, 8);
@@ -1202,7 +1203,7 @@ static int decode_seq_header(AVSContext *h)
         return AVERROR_PATCHWELCOME;
     }
     h->level   = get_bits(&h->gb, 8);
-    skip_bits1(&h->gb); //progressive sequence
+    h->progressive_seq = get_bits1(&h->gb);
 
     width  = get_bits(&h->gb, 14);
     height = get_bits(&h->gb, 14);
@@ -1230,14 +1231,24 @@ static int decode_seq_header(AVSContext *h)
     skip_bits(&h->gb, 12); //bit_rate_upper
     h->low_delay =  get_bits1(&h->gb);
 
-    ret = ff_set_dimensions(h->avctx, width, height);
+    mb_width  = (width  + 15) >> 4;
+    /* an interlaced sequence is rounded up to an even number of
+     * macroblock rows (GY/T 257.1-2012 clause 7.2.2) */
+    mb_height = h->progressive_seq ? (height + 15) >> 4
+                                   : ((height + 31) >> 5) * 2;
+
+    /* the coded picture is the macroblock grid; horizontal_size and
+     * vertical_size are the displayed part of it (clause 7.2.2) */
+    ret = ff_set_dimensions(h->avctx, mb_width * 16, mb_height * 16);
     if (ret < 0)
         return ret;
+    h->avctx->width  = width;
+    h->avctx->height = height;
 
-    h->width  = width;
-    h->height = height;
-    h->mb_width  = (h->width  + 15) >> 4;
-    h->mb_height = (h->height + 15) >> 4;
+    h->width     = width;
+    h->height    = height;
+    h->mb_width  = mb_width;
+    h->mb_height = mb_height;
     h->avctx->framerate = ff_mpeg12_frame_rate_tab[frame_rate_code];
     if (!h->top_qp)
         return ff_cavs_init_top_lines(h);
