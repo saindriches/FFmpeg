@@ -57,7 +57,7 @@ static const uint8_t tc_tab[64] = {
 
 /** mark block as unavailable, i.e. out of picture
  *  or not yet decoded */
-static const cavs_vector un_mv = { 0, 0, 1, NOT_AVAIL };
+static const cavs_vector un_mv = { 0, 0, 1, NOT_AVAIL, 0 };
 
 /** Inverse block scan method 2 (clause 9.5.3 c), figure 23), for field
     coded pictures, as the inverse ff_permute_scantable() expects. */
@@ -500,11 +500,12 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
         chroma_op = chroma_avg;
     }
 
-    if ((mv + MV_BWD_OFFS)->ref >= 0) {
-        /* the backward reference of a B frame picture is DPB[0] */
-        mc_dir_part(h, h->DPB[0].f, 0, chroma_height, 1,
+    mv += MV_BWD_OFFS;
+    if (mv->ref >= 0) {
+        mc_dir_part(h, h->ref[mv->ref].f, h->ref[mv->ref].parity,
+                    chroma_height, 1,
                     dest_y, dest_cb, dest_cr, x_offset, y_offset,
-                    qpix_op, chroma_op, mv + MV_BWD_OFFS);
+                    qpix_op, chroma_op, mv);
     }
 }
 
@@ -600,6 +601,9 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
 
     mvP->ref  = ref;
     mvP->dist = h->dist[mvP->ref];
+    /* a derived reference has index 0 (clause 9.4.5) */
+    if (mode >= MV_PRED_PSKIP)
+        mvP->ref_idx = 0;
     if (mvC->ref == NOT_AVAIL || (nP == MV_FWD_X3) || (nP == MV_BWD_X3 ))
         mvC = &h->mv[nP - 5];  // set to top-left (mvD)
     if (mode == MV_PRED_PSKIP &&
@@ -826,6 +830,7 @@ int ff_cavs_init_top_lines(AVSContext *h)
     h->top_pred_Y   = av_calloc(h->mb_width * 2,  sizeof(*h->top_pred_Y));
     h->top_cbp      = av_mallocz(h->mb_width);
     h->top_c_pred_mode = av_mallocz(h->mb_width);
+    h->top_mb_type  = av_mallocz(h->mb_width);
     h->top_border_y = av_calloc(h->mb_width + 1,  16);
     h->top_border_u = av_calloc(h->mb_width,  10);
     h->top_border_v = av_calloc(h->mb_width,  10);
@@ -837,12 +842,13 @@ int ff_cavs_init_top_lines(AVSContext *h)
     h->block         = av_mallocz(64 * sizeof(int16_t));
 
     if (!h->top_qp || !h->top_mv[0] || !h->top_mv[1] || !h->top_pred_Y ||
-        !h->top_cbp || !h->top_c_pred_mode ||
+        !h->top_cbp || !h->top_c_pred_mode || !h->top_mb_type ||
         !h->top_border_y || !h->top_border_u || !h->top_border_v ||
         !h->col_mv || !h->col_type_base || !h->block) {
         av_freep(&h->top_qp);
         av_freep(&h->top_cbp);
         av_freep(&h->top_c_pred_mode);
+        av_freep(&h->top_mb_type);
         av_freep(&h->top_mv[0]);
         av_freep(&h->top_mv[1]);
         av_freep(&h->top_pred_Y);
@@ -914,6 +920,7 @@ av_cold int ff_cavs_end(AVCodecContext *avctx)
     av_freep(&h->top_qp);
     av_freep(&h->top_cbp);
     av_freep(&h->top_c_pred_mode);
+    av_freep(&h->top_mb_type);
     av_freep(&h->top_mv[0]);
     av_freep(&h->top_mv[1]);
     av_freep(&h->top_pred_Y);

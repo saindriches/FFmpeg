@@ -153,6 +153,9 @@ typedef struct cavs_vector {
     int16_t y;
     int16_t dist;
     int16_t ref;
+    /** mb_reference_index of the block, 0 when it codes none (cl. 9.4.5);
+       ref above is where the reference list puts it */
+    int16_t ref_idx;
 } cavs_vector;
 
 struct dec_2dvlc {
@@ -177,13 +180,14 @@ typedef struct AVSContext {
     GetBitContext gb;
     AVSFrame cur;     ///< currently decoded frame
     AVSFrame DPB[2];  ///< reference frames
-    /** The forward reference of every reference index, cl. 9.4.5: a frame,
-       or the field of one starting at parity. */
+    /** The reference of every reference index, cl. 9.4.5: a frame, or the
+       field of one starting at parity; both lists share the array. */
     struct {
         AVFrame *f;   ///< frame the reference belongs to
         int parity;   ///< first line of the reference field inside it
     } ref[4];
-    int dist[2];     ///< temporal distances from current frame to ref frames
+    int ref_base[2]; ///< first entry of the forward and the backward list
+    int dist[4];     ///< BlockDistance of every reference, cl. 9.4.6.1
     int low_delay;
     int progressive_seq;
     int profile, level;
@@ -203,6 +207,10 @@ typedef struct AVSContext {
     int prev_delta_qp;  ///< PreviousDeltaQP of cl. 9.4.8, an AEC context
     int left_cbp;       ///< MbCBP of the macroblock to the left
     uint8_t *top_cbp;   ///< MbCBP of the macroblock above, one per column
+    /** MbType of the macroblock to the left, cl. 8.4.4.2 b) */
+    int left_mb_type;
+    /** MbType of the macroblock above, one per column */
+    uint8_t *top_mb_type;
     /** IntraChromaPredMode of the macroblock to the left, cl. 8.4.4.2 e) */
     int left_c_pred_mode;
     /** IntraChromaPredMode of the macroblock above, one per column */
@@ -264,9 +272,8 @@ typedef struct AVSContext {
     void (*intra_pred_c[7])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
     uint8_t *col_type_base;
 
-    /* scaling factors for MV prediction */
-    int sym_factor;    ///< for scaling in symmetrical B block
-    int scale_den[2];  ///< for scaling neighbouring MVs
+    /** 512 / dist[], for scaling neighbouring MVs (cl. 9.4.6.2 step 3) */
+    int scale_den[4];
 
     uint8_t *edge_emu_buffer;
 

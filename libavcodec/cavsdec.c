@@ -470,6 +470,8 @@ static inline void store_mvs(AVSContext *h)
     h->col_mv[h->mbidx * 4 + 3] = h->mv[MV_FWD_X3];
 }
 
+/** Direct mode: scale the co-located motion vector by its own
+    BlockDistance, carried in the mv cache (clause 9.9.1 b)). */
 static inline void mv_pred_direct(AVSContext *h, cavs_vector *pmv_fw,
                                   cavs_vector *col_mv)
 {
@@ -479,10 +481,20 @@ static inline void mv_pred_direct(AVSContext *h, cavs_vector *pmv_fw,
     unsigned den = col_mv->dist ? 16384 / col_mv->dist : 0;
     int m = FF_SIGNBIT(col_mv->x);
 
-    pmv_fw->dist = h->dist[1];
-    pmv_bw->dist = h->dist[0];
-    pmv_fw->ref = 1;
-    pmv_bw->ref = 0;
+    pmv_fw->ref = h->ref_base[0];
+    pmv_bw->ref = h->ref_base[1];
+    if (!h->pic_structure) {
+        /* reference field selection of 9.9.1 b) 1), BFieldEnhanced 0 */
+        int di_col = h->DPB[0].poc + h->field;
+        int di_ref = (di_col - col_mv->dist) & 511;
+        int di_fw0 = (h->DPB[1].poc + 1)     & 511;
+
+        pmv_fw->ref += di_ref != di_fw0;
+        pmv_bw->ref += h->field;
+    }
+    pmv_fw->dist    = h->dist[pmv_fw->ref];
+    pmv_bw->dist    = h->dist[pmv_bw->ref];
+    pmv_fw->ref_idx = pmv_bw->ref_idx = 0;      /* derived (clause 9.4.5) */
     /* scale the co-located motion vector according to its temporal span */
     pmv_fw->x =     (((den + (den * col_mv->x * pmv_fw->dist ^ m) - m - 1) >> 14) ^ m) - m;
     pmv_bw->x = m - (((den + (den * col_mv->x * pmv_bw->dist ^ m) - m - 1) >> 14) ^ m);
@@ -491,16 +503,24 @@ static inline void mv_pred_direct(AVSContext *h, cavs_vector *pmv_fw,
     pmv_bw->y = m - (((den + (den * col_mv->y * pmv_bw->dist ^ m) - m - 1) >> 14) ^ m);
 }
 
+/** Symmetric mode: derive the backward mv from the forward one, scaled by
+    the block's own pair of distances (clause 9.9.1 c)). */
 static inline void mv_pred_sym(AVSContext *h, cavs_vector *src,
                                enum cavs_block size)
 {
     cavs_vector *dst = src + MV_BWD_OFFS;
+    int factor;
 
+    if (h->pic_structure)
+        dst->ref = h->ref_base[1];
+    else
+        dst->ref = h->ref_base[1] + 1 - (src->ref - h->ref_base[0]);
+    dst->dist    = h->dist[dst->ref];
+    dst->ref_idx = 0;               /* derived, not read (clause 9.4.5) */
+    factor    = dst->dist * h->scale_den[src->ref];
     /* backward mv is the scaled and negated forward mv */
-    dst->x = -((src->x * h->sym_factor + 256) >> 9);
-    dst->y = -((src->y * h->sym_factor + 256) >> 9);
-    dst->ref = 0;
-    dst->dist = h->dist[0];
+    dst->x = -((src->x * factor + 256) >> 9);
+    dst->y = -((src->y * factor + 256) >> 9);
     set_mvs(dst, size);
 }
 
@@ -608,12 +628,6 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
  *
  * advanced entropy coding (AEC), GY/T 257.1-2012 clause 8.4
  *
- * The binarisations of tables 44 to 50 and the ctxIdxInc derivations of
- * clause 8.4.4.2, on top of the arithmetic decoding engine of cavs_aec.c.
- * mb_part_type, mb_reference_index and weighting_prediction, which only a
- * B picture, a field coded inter picture and a weighted slice carry, are
- * not implemented; neither picture is decoded.
- *
  ****************************************************************************/
 
 /* Table 51: start index of every ae(v) coded syntax element; an element
@@ -682,6 +696,68 @@ static int aec_mb_type_p(AVSContext *h)
     }
     /* table 54, both columns at once */
     return v ? v - 1 + h->skip_mode_flag : 5;
+}
+
+/**
+ * Decode mb_type in a B picture (table 45, 8.4.4.2 b)).
+ * @return MbTypeIndex, 0 to 24 of table 56, or a negative error code
+ */
+static int aec_mb_type_b(AVSContext *h)
+{
+    /* the neighbour is available and neither skipped nor direct coded */
+    int a = (h->flags & A_AVAIL) && h->left_mb_type        != B_SKIP &&
+                                    h->left_mb_type        != B_DIRECT;
+    int b = (h->flags & B_AVAIL) && h->top_mb_type[h->mbx] != B_SKIP &&
+                                    h->top_mb_type[h->mbx] != B_DIRECT;
+    int v = 1;
+    int bin;
+
+    if (!ff_cavs_aec_decode_decision(&h->aec, AEC_MB_TYPE + 5 + a + b))
+        return h->skip_mode_flag;
+    for (bin = 1;
+         !ff_cavs_aec_decode_decision(&h->aec,
+                                      AEC_MB_TYPE + 7 + FFMIN(bin, 7));
+         bin++) {
+        if (++v > 24 - h->skip_mode_flag) {
+            av_log(h->avctx, AV_LOG_ERROR, "mb_type out of range\n");
+            return AVERROR_INVALIDDATA;
+        }
+    }
+    return v + h->skip_mode_flag;
+}
+
+/** Decode mb_part_type (tables 46 and 57, 8.4.4.2 c)).
+    @return MbPartType, 0 to 3 */
+static int aec_mb_part_type(AVSContext *h)
+{
+    int b0 = ff_cavs_aec_decode_decision(&h->aec, AEC_MB_PART_TYPE);
+    int b1 = ff_cavs_aec_decode_decision(&h->aec,
+                                         AEC_MB_PART_TYPE + (b0 ? 2 : 1));
+
+    return (b0 << 1) | b1;
+}
+
+/**
+ * Decode mb_reference_index: table 44 unary in a P picture, one inverted
+ * bin in a B one (8.4.3 j), 8.4.4.2 f)).
+ * @return the reference index, or a negative error code
+ */
+static int aec_ref_index(AVSContext *h, int ctx_inc, int max)
+{
+    int v;
+
+    if (ff_cavs_aec_decode_decision(&h->aec,
+                                    AEC_MB_REFERENCE_INDEX + ctx_inc))
+        return 0;
+    if (h->cur.f->pict_type == AV_PICTURE_TYPE_B)
+        return 1;
+    if (ff_cavs_aec_decode_decision(&h->aec, AEC_MB_REFERENCE_INDEX + 4))
+        return 1;
+    for (v = 2; v <= max; v++)
+        if (ff_cavs_aec_decode_decision(&h->aec, AEC_MB_REFERENCE_INDEX + 5))
+            return v;
+    av_log(h->avctx, AV_LOG_ERROR, "mb_reference_index out of range\n");
+    return AVERROR_INVALIDDATA;
 }
 
 /**
@@ -1088,6 +1164,8 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
     int ret;
 
     ff_cavs_init_mb(h);
+    h->left_mb_type        = I_8X8;
+    h->top_mb_type[h->mbx] = I_8X8;
 
     /* get intra prediction modes from stream */
     for (block = 0; block < 4; block++) {
@@ -1192,16 +1270,42 @@ static inline void set_intra_mode_default(AVSContext *h)
 }
 
 /**
- * Read one mb_reference_index (table 26, clause 9.4.5). An intra picture
- * has PictureType 0 (clause 9.2), so the second field of a field coded one
- * codes no index and takes index 0, the picture's own first field
- * (figure 14).
+ * Read one mb_reference_index into the mv cache and turn it into a
+ * reference list index (table 26, clauses 7.2.5 and 9.4.5). Table 26
+ * prints its presence predicate with one parenthesis missing; this is the
+ * only bracketing consistent with picture_reference_flag (clause 7.2.3.2).
+ * @return the reference list index, or a negative error code
  */
-static inline int decode_ref_index(AVSContext *h)
+static int decode_ref_index(AVSContext *h, int list, enum cavs_mv_loc nP)
 {
-    if (h->cur.f->pict_type != AV_PICTURE_TYPE_P || h->ref_flag)
-        return 0;
-    return get_bits1(&h->gb);
+    const int base = h->ref_base[list];
+    /* NumberOfReference of one direction, clause 9.4.5 figures 15 to 20 */
+    const int max  = !h->pic_structure &&
+                     h->cur.f->pict_type == AV_PICTURE_TYPE_P ? 3 : 1;
+    int idx = 0;
+
+    if (!h->ref_flag &&
+        (h->cur.f->pict_type == AV_PICTURE_TYPE_P ||
+         (h->cur.f->pict_type == AV_PICTURE_TYPE_B && !h->pic_structure))) {
+        if (h->aec_enable) {
+            /* a and b of 8.4.4.2 f): the neighbouring block's index is
+             * greater than 0 (unusable neighbours hold a negative one) */
+            int a = h->mv[nP - 1].ref_idx > 0;
+            int b = h->mv[nP - 4].ref_idx > 0;
+
+            idx = aec_ref_index(h, a + 2 * b, max);
+        } else {
+            idx = get_bits(&h->gb, max > 1 ? 2 : 1);
+        }
+        if (idx < 0 || idx > max) {
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "mb_reference_index %d out of range\n", idx);
+            return AVERROR_INVALIDDATA;
+        }
+    }
+    h->mv[nP].ref     = base + idx;
+    h->mv[nP].ref_idx = idx;
+    return base + idx;
 }
 
 /** Decode one motion vector: under AEC its mv_diff must be read before
@@ -1225,12 +1329,22 @@ static int decode_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
             return ret;                                         \
     } while (0)
 
+#define REF(dst, list, nP)                                      \
+    do {                                                        \
+        ret = decode_ref_index(h, list, nP);                    \
+        if (ret < 0)                                            \
+            return ret;                                         \
+        dst = ret;                                              \
+    } while (0)
+
 static int decode_mb_p(AVSContext *h, enum cavs_mb mb_type)
 {
     int ref[4];
     int ret;
 
     ff_cavs_init_mb(h);
+    h->left_mb_type        = mb_type;
+    h->top_mb_type[h->mbx] = mb_type;
     /* leave behind what a later intra macroblock's contexts read */
     h->left_c_pred_mode        = INTRA_C_LP;
     h->top_c_pred_mode[h->mbx] = INTRA_C_LP;
@@ -1241,29 +1355,29 @@ static int decode_mb_p(AVSContext *h, enum cavs_mb mb_type)
     }
     switch (mb_type) {
     case P_SKIP:
-        MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_PSKIP,  BLK_16X16, 0);
+        MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_PSKIP,  BLK_16X16, h->ref_base[0]);
         break;
     case P_16X16:
-        ref[0] = decode_ref_index(h);
+        REF(ref[0], 0, MV_FWD_X0);
         MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_MEDIAN, BLK_16X16, ref[0]);
         break;
     case P_16X8:
-        ref[0] = decode_ref_index(h);
-        ref[2] = decode_ref_index(h);
+        REF(ref[0], 0, MV_FWD_X0);
+        REF(ref[2], 0, MV_FWD_X2);
         MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_TOP,    BLK_16X8, ref[0]);
         MV(MV_FWD_X2, MV_FWD_A1, MV_PRED_LEFT,   BLK_16X8, ref[2]);
         break;
     case P_8X16:
-        ref[0] = decode_ref_index(h);
-        ref[1] = decode_ref_index(h);
+        REF(ref[0], 0, MV_FWD_X0);
+        REF(ref[1], 0, MV_FWD_X1);
         MV(MV_FWD_X0, MV_FWD_B3, MV_PRED_LEFT,     BLK_8X16, ref[0]);
         MV(MV_FWD_X1, MV_FWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, ref[1]);
         break;
     case P_8X8:
-        ref[0] = decode_ref_index(h);
-        ref[1] = decode_ref_index(h);
-        ref[2] = decode_ref_index(h);
-        ref[3] = decode_ref_index(h);
+        REF(ref[0], 0, MV_FWD_X0);
+        REF(ref[1], 0, MV_FWD_X1);
+        REF(ref[2], 0, MV_FWD_X2);
+        REF(ref[3], 0, MV_FWD_X3);
         MV(MV_FWD_X0, MV_FWD_B3, MV_PRED_MEDIAN,   BLK_8X8, ref[0]);
         MV(MV_FWD_X1, MV_FWD_C2, MV_PRED_MEDIAN,   BLK_8X8, ref[1]);
         MV(MV_FWD_X2, MV_FWD_X1, MV_PRED_MEDIAN,   BLK_8X8, ref[2]);
@@ -1281,8 +1395,6 @@ static int decode_mb_p(AVSContext *h, enum cavs_mb mb_type)
     h->col_type_base[h->mbidx] = mb_type;
     return 0;
 }
-
-#undef MV
 
 /**
  * Decode one macroblock of a P coded macroblock layer, table 25.
@@ -1342,8 +1454,21 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
     int block;
     enum cavs_sub_mb sub_type[4];
     int flags;
+    int ref[2][4];
+    int ret;
 
     ff_cavs_init_mb(h);
+    h->left_mb_type        = mb_type;
+    h->top_mb_type[h->mbx] = mb_type;
+    /* an inter macroblock leaves the neighbour state an AEC context model
+     * reads exactly as decode_mb_p() does */
+    h->left_c_pred_mode        = INTRA_C_LP;
+    h->top_c_pred_mode[h->mbx] = INTRA_C_LP;
+    if (mb_type == B_SKIP) {
+        h->left_cbp        = 0;
+        h->top_cbp[h->mbx] = 0;
+        h->prev_delta_qp   = 0;
+    }
 
     /* reset all MVs */
     h->mv[MV_FWD_X0] = ff_cavs_dir_mv;
@@ -1354,9 +1479,12 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
     case B_SKIP:
     case B_DIRECT:
         if (!h->col_type_base[h->mbidx]) {
-            /* intra MB at co-location, do in-plane prediction */
-            ff_cavs_mv(h, MV_FWD_X0, MV_FWD_C2, MV_PRED_BSKIP, BLK_16X16, 1);
-            ff_cavs_mv(h, MV_BWD_X0, MV_BWD_C2, MV_PRED_BSKIP, BLK_16X16, 0);
+            /* intra MB at co-location: in-plane prediction with the
+             * default reference of each direction (9.9.1 b) 1)) */
+            ff_cavs_mv(h, MV_FWD_X0, MV_FWD_C2, MV_PRED_BSKIP, BLK_16X16,
+                       h->ref_base[0]);
+            ff_cavs_mv(h, MV_BWD_X0, MV_BWD_C2, MV_PRED_BSKIP, BLK_16X16,
+                       h->ref_base[1]);
         } else
             /* direct prediction from co-located P MB, block-wise */
             for (block = 0; block < 4; block++)
@@ -1364,20 +1492,35 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
                                &h->col_mv[h->mbidx * 4 + block]);
         break;
     case B_FWD_16X16:
-        ff_cavs_mv(h, MV_FWD_X0, MV_FWD_C2, MV_PRED_MEDIAN, BLK_16X16, 1);
+        REF(ref[0][0], 0, MV_FWD_X0);
+        MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_MEDIAN, BLK_16X16, ref[0][0]);
         break;
     case B_SYM_16X16:
-        ff_cavs_mv(h, MV_FWD_X0, MV_FWD_C2, MV_PRED_MEDIAN, BLK_16X16, 1);
+        REF(ref[0][0], 0, MV_FWD_X0);
+        MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_MEDIAN, BLK_16X16, ref[0][0]);
         mv_pred_sym(h, &h->mv[MV_FWD_X0], BLK_16X16);
         break;
     case B_BWD_16X16:
-        ff_cavs_mv(h, MV_BWD_X0, MV_BWD_C2, MV_PRED_MEDIAN, BLK_16X16, 0);
+        REF(ref[1][0], 1, MV_BWD_X0);
+        MV(MV_BWD_X0, MV_BWD_C2, MV_PRED_MEDIAN, BLK_16X16, ref[1][0]);
         break;
     case B_8X8:
 #define TMP_UNUSED_INX  7
         flags = 0;
+        for (block = 0; block < 4; block++) {
+            if (h->aec_enable)
+                sub_type[block] = aec_mb_part_type(h);
+            else
+                sub_type[block] = get_bits(&h->gb, 2);
+        }
+        /* all forward reference indices come first (table 26); a
+         * symmetric block codes only its forward one */
         for (block = 0; block < 4; block++)
-            sub_type[block] = get_bits(&h->gb, 2);
+            if (sub_type[block] == B_SUB_FWD || sub_type[block] == B_SUB_SYM)
+                REF(ref[0][block], 0, mv_scan[block]);
+        for (block = 0; block < 4; block++)
+            if (sub_type[block] == B_SUB_BWD)
+                REF(ref[1][block], 1, mv_scan[block] + MV_BWD_OFFS);
         for (block = 0; block < 4; block++) {
             switch (sub_type[block]) {
             case B_SUB_DIRECT:
@@ -1391,10 +1534,10 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
                             h->mv[TMP_UNUSED_INX + MV_BWD_OFFS] = h->mv[MV_FWD_X0 + MV_BWD_OFFS];
                         }
                         ff_cavs_mv(h, MV_FWD_X0, MV_FWD_C2,
-                                   MV_PRED_BSKIP, BLK_8X8, 1);
+                                   MV_PRED_BSKIP, BLK_8X8, h->ref_base[0]);
                         ff_cavs_mv(h, MV_FWD_X0+MV_BWD_OFFS,
                                    MV_FWD_C2+MV_BWD_OFFS,
-                                   MV_PRED_BSKIP, BLK_8X8, 0);
+                                   MV_PRED_BSKIP, BLK_8X8, h->ref_base[1]);
                         if(block>0) {
                             flags = mv_scan[block];
                             h->mv[flags              ] = h->mv[MV_FWD_X0              ];
@@ -1412,12 +1555,12 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
                                    &h->col_mv[h->mbidx * 4 + block]);
                 break;
             case B_SUB_FWD:
-                ff_cavs_mv(h, mv_scan[block], mv_scan[block] - 3,
-                           MV_PRED_MEDIAN, BLK_8X8, 1);
+                MV(mv_scan[block], mv_scan[block] - 3,
+                   MV_PRED_MEDIAN, BLK_8X8, ref[0][block]);
                 break;
             case B_SUB_SYM:
-                ff_cavs_mv(h, mv_scan[block], mv_scan[block] - 3,
-                           MV_PRED_MEDIAN, BLK_8X8, 1);
+                MV(mv_scan[block], mv_scan[block] - 3,
+                   MV_PRED_MEDIAN, BLK_8X8, ref[0][block]);
                 mv_pred_sym(h, &h->mv[mv_scan[block]], BLK_8X8);
                 break;
             }
@@ -1425,9 +1568,9 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
 #undef TMP_UNUSED_INX
         for (block = 0; block < 4; block++) {
             if (sub_type[block] == B_SUB_BWD)
-                ff_cavs_mv(h, mv_scan[block] + MV_BWD_OFFS,
-                           mv_scan[block] + MV_BWD_OFFS - 3,
-                           MV_PRED_MEDIAN, BLK_8X8, 0);
+                MV(mv_scan[block] + MV_BWD_OFFS,
+                   mv_scan[block] + MV_BWD_OFFS - 3,
+                   MV_PRED_MEDIAN, BLK_8X8, ref[1][block]);
         }
         break;
     default:
@@ -1439,38 +1582,112 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
         flags = ff_cavs_partition_flags[mb_type];
         if (mb_type & 1) { /* 16x8 macroblock types */
             if (flags & FWD0)
-                ff_cavs_mv(h, MV_FWD_X0, MV_FWD_C2, MV_PRED_TOP,  BLK_16X8, 1);
+                REF(ref[0][0], 0, MV_FWD_X0);
+            if (flags & FWD1)
+                REF(ref[0][2], 0, MV_FWD_X2);
+            if (flags & BWD0)
+                REF(ref[1][0], 1, MV_BWD_X0);
+            if (flags & BWD1)
+                REF(ref[1][2], 1, MV_BWD_X2);
+            if (flags & FWD0)
+                MV(MV_FWD_X0, MV_FWD_C2, MV_PRED_TOP,  BLK_16X8, ref[0][0]);
             if (flags & SYM0)
                 mv_pred_sym(h, &h->mv[MV_FWD_X0], BLK_16X8);
             if (flags & FWD1)
-                ff_cavs_mv(h, MV_FWD_X2, MV_FWD_A1, MV_PRED_LEFT, BLK_16X8, 1);
+                MV(MV_FWD_X2, MV_FWD_A1, MV_PRED_LEFT, BLK_16X8, ref[0][2]);
             if (flags & SYM1)
                 mv_pred_sym(h, &h->mv[MV_FWD_X2], BLK_16X8);
             if (flags & BWD0)
-                ff_cavs_mv(h, MV_BWD_X0, MV_BWD_C2, MV_PRED_TOP,  BLK_16X8, 0);
+                MV(MV_BWD_X0, MV_BWD_C2, MV_PRED_TOP,  BLK_16X8, ref[1][0]);
             if (flags & BWD1)
-                ff_cavs_mv(h, MV_BWD_X2, MV_BWD_A1, MV_PRED_LEFT, BLK_16X8, 0);
+                MV(MV_BWD_X2, MV_BWD_A1, MV_PRED_LEFT, BLK_16X8, ref[1][2]);
         } else {          /* 8x16 macroblock types */
             if (flags & FWD0)
-                ff_cavs_mv(h, MV_FWD_X0, MV_FWD_B3, MV_PRED_LEFT, BLK_8X16, 1);
+                REF(ref[0][0], 0, MV_FWD_X0);
+            if (flags & FWD1)
+                REF(ref[0][1], 0, MV_FWD_X1);
+            if (flags & BWD0)
+                REF(ref[1][0], 1, MV_BWD_X0);
+            if (flags & BWD1)
+                REF(ref[1][1], 1, MV_BWD_X1);
+            if (flags & FWD0)
+                MV(MV_FWD_X0, MV_FWD_B3, MV_PRED_LEFT, BLK_8X16, ref[0][0]);
             if (flags & SYM0)
                 mv_pred_sym(h, &h->mv[MV_FWD_X0], BLK_8X16);
             if (flags & FWD1)
-                ff_cavs_mv(h, MV_FWD_X1, MV_FWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, 1);
+                MV(MV_FWD_X1, MV_FWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, ref[0][1]);
             if (flags & SYM1)
                 mv_pred_sym(h, &h->mv[MV_FWD_X1], BLK_8X16);
             if (flags & BWD0)
-                ff_cavs_mv(h, MV_BWD_X0, MV_BWD_B3, MV_PRED_LEFT, BLK_8X16, 0);
+                MV(MV_BWD_X0, MV_BWD_B3, MV_PRED_LEFT, BLK_8X16, ref[1][0]);
             if (flags & BWD1)
-                ff_cavs_mv(h, MV_BWD_X1, MV_BWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, 0);
+                MV(MV_BWD_X1, MV_BWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, ref[1][1]);
         }
     }
     ff_cavs_inter(h, mb_type);
     set_intra_mode_default(h);
-    if (mb_type != B_SKIP)
-        decode_residual_inter(h);
+    if (mb_type != B_SKIP) {
+        ret = decode_residual_inter(h);
+        if (ret < 0)
+            return ret;
+    }
     ff_cavs_filter(h, mb_type);
 
+    return 0;
+}
+
+#undef MV
+#undef REF
+
+/**
+ * Decode one macroblock of a B coded macroblock layer, tables 25 and 26.
+ * @param skip_count what is left of the current mb_skip_run, or -1 when the
+ *                   next macroblock position starts a new one
+ */
+static int decode_mb_b_layer(AVSContext *h, int *skip_count)
+{
+    enum cavs_mb mb_type;
+    int ret;
+
+    if (h->skip_mode_flag && *skip_count < 0) {
+        if (h->aec_enable) {
+            *skip_count = aec_mb_skip_run(h);
+        } else {
+            if (get_bits_left(&h->gb) < 1)
+                return AVERROR_INVALIDDATA;
+            *skip_count = get_ue_golomb(&h->gb);
+        }
+        if (*skip_count < 0)
+            return AVERROR_INVALIDDATA;
+    }
+    if (h->skip_mode_flag && (*skip_count)--) {
+        ret = decode_mb_b(h, B_SKIP);
+        if (ret < 0)
+            return ret;
+        if (h->aec_enable && !*skip_count &&
+            ff_cavs_aec_decode_stuffing_bit(&h->aec))
+            aec_end_of_slice(h);
+        return 0;
+    }
+
+    if (h->aec_enable) {
+        ret = aec_mb_type_b(h);
+        if (ret < 0)
+            return ret;
+        mb_type = ret + B_SKIP;
+    } else {
+        if (get_bits_left(&h->gb) < 1)
+            return AVERROR_INVALIDDATA;
+        mb_type = get_ue_golomb(&h->gb) + B_SKIP + h->skip_mode_flag;
+    }
+    if (mb_type > B_8X8)
+        ret = decode_mb_i(h, mb_type - B_8X8 - 1);
+    else
+        ret = decode_mb_b(h, mb_type);
+    if (ret < 0)
+        return ret;
+    if (h->aec_enable && ff_cavs_aec_decode_stuffing_bit(&h->aec))
+        aec_end_of_slice(h);
     return 0;
 }
 
@@ -1598,37 +1815,102 @@ static inline int check_for_slice(AVSContext *h)
  ****************************************************************************/
 
 /**
- * Build the forward reference of every reference index, clause 9.4.5:
- * whole frames for a frame coded picture (figures 15 and 18); the second
- * field of an intra picture references its own first field (figure 14).
+ * Build the reference list and the temporal distances of the current
+ * frame or field (clause 9.4.5 figures 14 to 20, clause 9.4.6.1); cur.poc
+ * is 2 * picture_distance, the DistanceIndex of a first field.
  */
-static void set_ref_list(AVSContext *h)
+static int set_ref_list(AVSContext *h)
 {
-    int i;
+    /* the first coded field is the first displayed one (clause 7.2.3.1),
+     * and annex B.2 b) keeps top_field_first constant over the sequence */
+    const int f1   = !h->top_field_first;   /* parity of a first field  */
+    const int f2   =  h->top_field_first;   /* parity of a second field */
+    const int b    = h->cur.f->pict_type == AV_PICTURE_TYPE_B;
+    const int poc  = h->cur.poc;
+    const int poc0 = h->DPB[0].poc;
+    const int poc1 = h->DPB[1].poc;
+    int i, nref;
 
-    /* only indices 0 and 1 are reachable in a frame coded picture (clause
-     * 7.2.5); the remaining entries repeat an existing reference so that a
-     * damaged index cannot reach one that is not there */
-    for (i = 0; i < FF_ARRAY_ELEMS(h->ref); i++) {
-        h->ref[i].f      = h->DPB[i > 0].f;
-        h->ref[i].parity = 0;
+#define REF(idx, frame, par, distance)          \
+    do {                                        \
+        h->ref[idx].f      = (frame);           \
+        h->ref[idx].parity = (par);             \
+        h->dist[idx]       = (distance) & 511;  \
+    } while (0)
+
+    h->ref_base[0] = h->ref_base[1] = 0;
+
+    if (h->pic_structure) {
+        /* figures 15 and 18: whole frames, most recent first; the
+         * unreachable entries repeat DPB[1] to stay inside the DPB */
+        REF(0, h->DPB[0].f, 0, b ? poc0 - poc : poc - poc0);
+        for (i = 1; i < FF_ARRAY_ELEMS(h->ref); i++)
+            REF(i, h->DPB[1].f, 0, poc - poc1);
+        /* figure 18: a B frame picture predicts forward from DPB[1] and
+         * backward from DPB[0], and codes no reference index at all */
+        h->ref_base[0] = b;
+        nref = 1;
+    } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
+        /* figure 14: the second field of an intra picture references its
+         * own first field, one field period away */
+        for (i = 0; i < FF_ARRAY_ELEMS(h->ref); i++)
+            REF(i, h->cur.f, f1, 1);
+        nref = 1;
+    } else if (!b) {
+        if (!h->field) {
+            /* figure 16: the four fields of the two previous frames */
+            REF(0, h->DPB[0].f, f2, poc - poc0 - 1);
+            REF(1, h->DPB[0].f, f1, poc - poc0);
+            REF(2, h->DPB[1].f, f2, poc - poc1 - 1);
+            REF(3, h->DPB[1].f, f1, poc - poc1);
+        } else {
+            /* figure 17: the first field of the picture itself, then the
+             * three nearest fields before it */
+            REF(0, h->cur.f,    f1, 1);
+            REF(1, h->DPB[0].f, f2, poc - poc0);
+            REF(2, h->DPB[0].f, f1, poc - poc0 + 1);
+            REF(3, h->DPB[1].f, f2, poc - poc1);
+        }
+        nref = 4;
+    } else {
+        /* figures 19 and 20: two backward and two forward fields, each
+         * direction nearest field first */
+        REF(0, h->DPB[0].f, f1, poc0     - poc - h->field);
+        REF(1, h->DPB[0].f, f2, poc0 + 1 - poc - h->field);
+        REF(2, h->DPB[1].f, f2, poc + h->field - poc1 - 1);
+        REF(3, h->DPB[1].f, f1, poc + h->field - poc1);
+        h->ref_base[0] = 2;
+        nref = 2;
     }
-    if (h->field && h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
-        /* figure 14: one reference, the picture's own first field, one
-         * field period away (clause 9.4.6.1), so nothing is scaled */
-        h->ref[0].f      = h->cur.f;
-        h->ref[0].parity = !h->top_field_first;
-        h->dist[0]       = 1;
-        h->scale_den[0]  = 512;
+#undef REF
+
+    for (i = 0; i < FF_ARRAY_ELEMS(h->ref); i++)
+        h->scale_den[i] = h->dist[i] ? 512 / h->dist[i] : 0;
+
+    /* bound the symmetric scaling factor of clause 9.9.1 c) for every
+     * reference pair the picture can use */
+    for (i = 0; b && i < nref; i++) {
+        int fw     = h->ref_base[0] + i;
+        int bw     = h->pic_structure ? h->ref_base[1]
+                                      : h->ref_base[1] + 1 - i;
+        int factor = h->dist[bw] * h->scale_den[fw];
+
+        if (factor > 32768) {
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "symmetric scaling factor %d too large\n", factor);
+            return AVERROR_INVALIDDATA;
+        }
     }
+    return 0;
 }
 
 static int decode_pic(AVSContext *h)
 {
     int ret;
+    int field;
     int skip_count    = -1;
     int weighting_quant_flag;
-    enum cavs_mb mb_type;
+    int pb_field_enhanced_flag = 0;
 
     if (!h->top_qp) {
         av_log(h->avctx, AV_LOG_ERROR, "No sequence header decoded yet\n");
@@ -1683,24 +1965,8 @@ static int decode_pic(AVSContext *h)
             return AVERROR(ENOMEM);
     }
 
+    /* picture_distance; DistanceIndex is twice it (clause 9.4.6.1) */
     h->cur.poc = get_bits(&h->gb, 8) * 2;
-
-    /* get temporal distances and MV scaling factors */
-    if (h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
-        h->dist[0] = (h->cur.poc - h->DPB[0].poc) & 511;
-    } else {
-        h->dist[0] = (h->DPB[0].poc  - h->cur.poc) & 511;
-    }
-    h->dist[1] = (h->cur.poc - h->DPB[1].poc) & 511;
-    h->scale_den[0] = h->dist[0] ? 512/h->dist[0] : 0;
-    h->scale_den[1] = h->dist[1] ? 512/h->dist[1] : 0;
-    if (h->cur.f->pict_type == AV_PICTURE_TYPE_B) {
-        h->sym_factor = h->dist[0] * h->scale_den[1];
-        if (FFABS(h->sym_factor) > 32768) {
-            av_log(h->avctx, AV_LOG_ERROR, "sym_factor %d too large\n", h->sym_factor);
-            return AVERROR_INVALIDDATA;
-        }
-    }
 
     if (h->low_delay)
         get_ue_golomb(&h->gb); //bbv_check_times
@@ -1736,10 +2002,14 @@ static int decode_pic(AVSContext *h)
     } else {
         if (!(h->cur.f->pict_type == AV_PICTURE_TYPE_B && h->pic_structure == 1))
             h->ref_flag        = get_bits1(&h->gb);
-        /* no_forward_reference_flag u(1), pb_field_enhanced_flag u(1) and
-         * reserved_bits r(2), per GY/T 257.1-2012 table 22. Both flags only
-         * take effect on field coded pictures (clauses 9.4.2 and 9.4.6). */
-        skip_bits(&h->gb, 4);
+        else
+            /* 1 for a frame coded B picture (clause 7.2.3.2) */
+            h->ref_flag        = 1;
+        /* no_forward_reference_flag (no effect on decoding),
+         * pb_field_enhanced_flag, reserved r(2); table 22 */
+        skip_bits1(&h->gb);
+        pb_field_enhanced_flag = get_bits1(&h->gb);
+        skip_bits(&h->gb, 2);
         h->skip_mode_flag      = get_bits1(&h->gb);
     }
     h->loop_filter_disable     = get_bits1(&h->gb);
@@ -1785,18 +2055,13 @@ static int decode_pic(AVSContext *h)
         return AVERROR_PATCHWELCOME;
     }
 
-    /* only the elements an intra macroblock carries are binarised so far */
-    if (h->aec_enable && h->cur.f->pict_type != AV_PICTURE_TYPE_I) {
-        avpriv_request_sample(h->avctx, "AEC coded inter picture");
+    /* with the flag clear the field derivations reduce to the frame ones
+     * (clause 9.9.1 b) 3)); with it set they are not implemented */
+    if (pb_field_enhanced_flag && !h->pic_structure) {
+        avpriv_request_sample(h->avctx, "Enhanced field coded PB picture");
         return AVERROR_PATCHWELCOME;
     }
 
-    /* a field coded inter picture needs the reference fields and field
-     * temporal distances of clauses 9.4.5 and 9.4.6.1, not yet there */
-    if (!h->pic_structure && h->cur.f->pict_type != AV_PICTURE_TYPE_I) {
-        avpriv_request_sample(h->avctx, "Field coded inter picture");
-        return AVERROR_PATCHWELCOME;
-    }
     if (!h->pic_structure) {
         h->cur.f->flags |= AV_FRAME_FLAG_INTERLACED;
         if (h->top_field_first)
@@ -1807,86 +2072,46 @@ static int decode_pic(AVSContext *h)
      * this can only run once the header has been walked to its end */
     if ((ret = ff_cavs_init_pic(h)) < 0)
         return ret;
-    set_ref_list(h);
+    if ((ret = set_ref_list(h)) < 0)
+        return ret;
 
-    ret = 0;
+    field = h->field;
+    ret   = 0;
     h->aec.gb = NULL;   /* started by the first slice header */
-    if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
-        int field = h->field;
-
-        do {
-            ret = check_for_slice(h);
-            if (ret < 0)
+    do {
+        ret = check_for_slice(h);
+        if (ret < 0)
+            break;
+        if (ret)
+            skip_count = -1;
+        if (h->aec_enable && !h->aec.gb) {
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "AEC picture without a slice header\n");
+            ret = AVERROR_INVALIDDATA;
+            break;
+        }
+        /* the two fields have different references and distances */
+        if (h->field != field) {
+            field = h->field;
+            if ((ret = set_ref_list(h)) < 0)
                 break;
-            if (ret)
-                skip_count = -1;
-            if (h->aec_enable && !h->aec.gb) {
-                av_log(h->avctx, AV_LOG_ERROR,
-                       "AEC picture without a slice header\n");
-                ret = AVERROR_INVALIDDATA;
-                break;
-            }
-            if (h->field != field) {
-                field = h->field;
-                set_ref_list(h);
-            }
+        }
+        if (h->cur.f->pict_type == AV_PICTURE_TYPE_B) {
+            ret = decode_mb_b_layer(h, &skip_count);
+        } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_P || h->field) {
             /* the second field of an intra picture is inter coded
              * (clause 9.4.2 a) 2), note to clause 3.80) */
-            if (h->field) {
-                ret = decode_mb_p_layer(h, &skip_count);
-            } else {
-                ret = decode_mb_i(h, 0);
-                /* an aec_mb_stuffing_bit follows every macroblock and is
-                 * 1 on the last one of the slice (7.2.4) */
-                if (ret >= 0 && h->aec_enable &&
-                    ff_cavs_aec_decode_stuffing_bit(&h->aec))
-                    aec_end_of_slice(h);
-            }
-            if (ret < 0)
-                break;
-        } while (ff_cavs_next_mb(h));
-    } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_P) {
-        do {
-            ret = check_for_slice(h);
-            if (ret < 0)
-                break;
-            if (ret)
-                skip_count = -1;
             ret = decode_mb_p_layer(h, &skip_count);
-            if (ret < 0)
-                break;
-        } while (ff_cavs_next_mb(h));
-    } else { /* AV_PICTURE_TYPE_B */
-        do {
-            ret = check_for_slice(h);
-            if (ret < 0)
-                break;
-            if (ret)
-                skip_count = -1;
-            if (h->skip_mode_flag && (skip_count < 0)) {
-                if (get_bits_left(&h->gb) < 1) {
-                    ret = AVERROR_INVALIDDATA;
-                    break;
-                }
-                skip_count = get_ue_golomb(&h->gb);
-            }
-            if (h->skip_mode_flag && skip_count--) {
-                ret = decode_mb_b(h, B_SKIP);
-            } else {
-                if (get_bits_left(&h->gb) < 1) {
-                    ret = AVERROR_INVALIDDATA;
-                    break;
-                }
-                mb_type = get_ue_golomb(&h->gb) + B_SKIP + h->skip_mode_flag;
-                if (mb_type > B_8X8)
-                    ret = decode_mb_i(h, mb_type - B_8X8 - 1);
-                else
-                    ret = decode_mb_b(h, mb_type);
-            }
-            if (ret < 0)
-                break;
-        } while (ff_cavs_next_mb(h));
-    }
+        } else {
+            ret = decode_mb_i(h, 0);
+            /* aec_mb_stuffing_bit is 1 on the slice's last MB (7.2.4) */
+            if (ret >= 0 && h->aec_enable &&
+                ff_cavs_aec_decode_stuffing_bit(&h->aec))
+                aec_end_of_slice(h);
+        }
+        if (ret < 0)
+            break;
+    } while (ff_cavs_next_mb(h));
     emms_c();
     if (ret >= 0 && h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
         av_frame_unref(h->DPB[1].f);
