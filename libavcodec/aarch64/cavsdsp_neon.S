@@ -121,3 +121,477 @@ function ff_cavs_idct8_add_neon, export=1
 .endr
         ret
 endfunc
+
+/*
+ * In-loop deblocking (clause 9.11 of GY/T 257.1-2012), all four edge
+ * kernels. The per sample condition masks are computed in the byte
+ * domain, the filter arithmetic in 16 bit lanes; (x + 4) >> 3 and
+ * (x + 2) >> 2 of the C code are srshr/rshrn. p3/q3 are loaded by the
+ * vertical kernels but never modified or stored.
+ */
+
+/* non-normative edge filter, bs < 2 (loop_filter_l1): p2/p1/p0/q0/q1/q2
+   in v16-v21 as 16 byte lanes, alpha w2, beta w3, tc w4, per sample
+   enable mask in v27; results replace v17-v20 */
+.macro cavs_lf_l1_16
+        dup             v25.16b, w2
+        dup             v26.16b, w3
+        uabd            v22.16b, v18.16b, v19.16b   // |p0 - q0|
+        uabd            v23.16b, v17.16b, v18.16b   // |p1 - p0|
+        uabd            v24.16b, v20.16b, v19.16b   // |q1 - q0|
+        cmhi            v22.16b, v25.16b, v22.16b
+        cmhi            v23.16b, v26.16b, v23.16b
+        cmhi            v24.16b, v26.16b, v24.16b
+        and             v22.16b, v22.16b, v23.16b
+        and             v22.16b, v22.16b, v24.16b
+        and             v22.16b, v22.16b, v27.16b   // filter this sample
+        uabd            v23.16b, v16.16b, v18.16b   // |p2 - p0|
+        uabd            v24.16b, v21.16b, v19.16b   // |q2 - q0|
+        cmhi            v23.16b, v26.16b, v23.16b
+        cmhi            v24.16b, v26.16b, v24.16b
+        and             v23.16b, v23.16b, v22.16b   // p1 also filtered
+        and             v24.16b, v24.16b, v22.16b   // q1 also filtered
+
+        usubl           v0.8h,  v19.8b,  v18.8b     // q0 - p0
+        usubl2          v1.8h,  v19.16b, v18.16b
+        usubl           v2.8h,  v17.8b,  v20.8b     // p1 - q1
+        usubl2          v3.8h,  v17.16b, v20.16b
+        shl             v4.8h,  v0.8h,  #1
+        shl             v5.8h,  v1.8h,  #1
+        add             v0.8h,  v0.8h,  v4.8h       // 3 * (q0 - p0)
+        add             v1.8h,  v1.8h,  v5.8h
+        add             v0.8h,  v0.8h,  v2.8h
+        add             v1.8h,  v1.8h,  v3.8h
+        srshr           v0.8h,  v0.8h,  #3          // (x + 4) >> 3
+        srshr           v1.8h,  v1.8h,  #3
+        dup             v25.8h, w4                  // tc
+        neg             v26.8h, v25.8h
+        smin            v0.8h,  v0.8h,  v25.8h
+        smin            v1.8h,  v1.8h,  v25.8h
+        smax            v0.8h,  v0.8h,  v26.8h      // delta
+        smax            v1.8h,  v1.8h,  v26.8h
+
+        uxtl            v2.8h,  v18.8b
+        uxtl2           v3.8h,  v18.16b
+        add             v2.8h,  v2.8h,  v0.8h       // p0 + delta
+        add             v3.8h,  v3.8h,  v1.8h
+        sqxtun          v6.8b,  v2.8h
+        sqxtun2         v6.16b, v3.8h               // new p0
+        uxtl            v4.8h,  v19.8b
+        uxtl2           v5.8h,  v19.16b
+        sub             v4.8h,  v4.8h,  v0.8h       // q0 - delta
+        sub             v5.8h,  v5.8h,  v1.8h
+        sqxtun          v7.8b,  v4.8h
+        sqxtun2         v7.16b, v5.8h               // new q0
+
+        uxtl            v2.8h,  v6.8b               // new p0, 16 bit
+        uxtl2           v3.8h,  v6.16b
+        uxtl            v4.8h,  v7.8b               // new q0, 16 bit
+        uxtl2           v5.8h,  v7.16b
+
+        uxtl            v28.8h, v17.8b              // p1
+        uxtl2           v29.8h, v17.16b
+        sub             v0.8h,  v2.8h,  v28.8h      // new p0 - p1
+        sub             v1.8h,  v3.8h,  v29.8h
+        shl             v30.8h, v0.8h,  #1
+        shl             v31.8h, v1.8h,  #1
+        add             v0.8h,  v0.8h,  v30.8h
+        add             v1.8h,  v1.8h,  v31.8h
+        uaddw           v0.8h,  v0.8h,  v16.8b      // + p2
+        uaddw2          v1.8h,  v1.8h,  v16.16b
+        sub             v0.8h,  v0.8h,  v4.8h       // - new q0
+        sub             v1.8h,  v1.8h,  v5.8h
+        srshr           v0.8h,  v0.8h,  #3
+        srshr           v1.8h,  v1.8h,  #3
+        smin            v0.8h,  v0.8h,  v25.8h
+        smin            v1.8h,  v1.8h,  v25.8h
+        smax            v0.8h,  v0.8h,  v26.8h
+        smax            v1.8h,  v1.8h,  v26.8h
+        add             v0.8h,  v0.8h,  v28.8h      // p1 + delta
+        add             v1.8h,  v1.8h,  v29.8h
+        sqxtun          v30.8b,  v0.8h
+        sqxtun2         v30.16b, v1.8h              // new p1
+
+        uxtl            v28.8h, v20.8b              // q1
+        uxtl2           v29.8h, v20.16b
+        sub             v0.8h,  v28.8h, v4.8h       // q1 - new q0
+        sub             v1.8h,  v29.8h, v5.8h
+        shl             v4.8h,  v0.8h,  #1
+        shl             v5.8h,  v1.8h,  #1
+        add             v0.8h,  v0.8h,  v4.8h
+        add             v1.8h,  v1.8h,  v5.8h
+        add             v0.8h,  v0.8h,  v2.8h       // + new p0
+        add             v1.8h,  v1.8h,  v3.8h
+        usubw           v0.8h,  v0.8h,  v21.8b      // - q2
+        usubw2          v1.8h,  v1.8h,  v21.16b
+        srshr           v0.8h,  v0.8h,  #3
+        srshr           v1.8h,  v1.8h,  #3
+        smin            v0.8h,  v0.8h,  v25.8h
+        smin            v1.8h,  v1.8h,  v25.8h
+        smax            v0.8h,  v0.8h,  v26.8h
+        smax            v1.8h,  v1.8h,  v26.8h
+        sub             v0.8h,  v28.8h, v0.8h       // q1 - delta
+        sub             v1.8h,  v29.8h, v1.8h
+        sqxtun          v31.8b,  v0.8h
+        sqxtun2         v31.16b, v1.8h              // new q1
+
+        mov             v0.16b, v22.16b
+        bsl             v0.16b, v6.16b,  v18.16b
+        mov             v1.16b, v22.16b
+        bsl             v1.16b, v7.16b,  v19.16b
+        mov             v2.16b, v23.16b
+        bsl             v2.16b, v30.16b, v17.16b
+        mov             v3.16b, v24.16b
+        bsl             v3.16b, v31.16b, v20.16b
+        mov             v17.16b, v2.16b
+        mov             v18.16b, v0.16b
+        mov             v19.16b, v1.16b
+        mov             v20.16b, v3.16b
+.endm
+
+/* normative edge filter, bs == 2 (loop_filter_l2): same register layout,
+   no tc and no enable mask, alpha w2, beta w3, w7 clobbered */
+.macro cavs_lf_l2_16
+        dup             v25.16b, w2
+        dup             v26.16b, w3
+        uabd            v28.16b, v18.16b, v19.16b   // |p0 - q0|
+        uabd            v23.16b, v17.16b, v18.16b   // |p1 - p0|
+        uabd            v24.16b, v20.16b, v19.16b   // |q1 - q0|
+        cmhi            v22.16b, v25.16b, v28.16b
+        cmhi            v23.16b, v26.16b, v23.16b
+        cmhi            v24.16b, v26.16b, v24.16b
+        and             v22.16b, v22.16b, v23.16b
+        and             v22.16b, v22.16b, v24.16b   // filter this sample
+        lsr             w7, w2, #2
+        add             w7, w7, #2                  // (alpha >> 2) + 2
+        dup             v27.16b, w7
+        cmhi            v28.16b, v27.16b, v28.16b   // |p0 - q0| < alpha2
+        uabd            v23.16b, v16.16b, v18.16b   // |p2 - p0|
+        uabd            v24.16b, v21.16b, v19.16b   // |q2 - q0|
+        cmhi            v23.16b, v26.16b, v23.16b
+        cmhi            v24.16b, v26.16b, v24.16b
+        and             v23.16b, v23.16b, v28.16b
+        and             v24.16b, v24.16b, v28.16b
+        and             v23.16b, v23.16b, v22.16b   // strong p side
+        and             v24.16b, v24.16b, v22.16b   // strong q side
+
+        uaddl           v0.8h,  v18.8b,  v19.8b     // p0 + q0
+        uaddl2          v1.8h,  v18.16b, v19.16b
+        uxtl            v2.8h,  v17.8b              // p1
+        uxtl2           v3.8h,  v17.16b
+        uxtl            v4.8h,  v18.8b              // p0
+        uxtl2           v5.8h,  v18.16b
+        add             v6.8h,  v0.8h,  v2.8h       // p1 + p0 + q0
+        add             v7.8h,  v1.8h,  v3.8h
+        add             v28.8h, v6.8h,  v4.8h       // p1 + 2*p0 + q0
+        add             v29.8h, v7.8h,  v5.8h
+        add             v30.8h, v6.8h,  v2.8h       // 2*p1 + p0 + q0
+        add             v31.8h, v7.8h,  v3.8h
+        rshrn           v6.8b,  v28.8h, #2          // (x + 2) >> 2
+        rshrn2          v6.16b, v29.8h, #2
+        rshrn           v7.8b,  v30.8h, #2
+        rshrn2          v7.16b, v31.8h, #2
+        mov             v28.16b, v23.16b
+        bsl             v28.16b, v6.16b, v7.16b     // p0 when filtered
+        mov             v29.16b, v22.16b
+        bsl             v29.16b, v28.16b, v18.16b   // new p0
+        mov             v30.16b, v23.16b
+        bsl             v30.16b, v7.16b, v17.16b    // new p1
+
+        uxtl            v2.8h,  v20.8b              // q1
+        uxtl2           v3.8h,  v20.16b
+        uxtl            v4.8h,  v19.8b              // q0
+        uxtl2           v5.8h,  v19.16b
+        add             v6.8h,  v0.8h,  v2.8h       // q1 + q0 + p0
+        add             v7.8h,  v1.8h,  v3.8h
+        add             v4.8h,  v6.8h,  v4.8h       // q1 + 2*q0 + p0
+        add             v5.8h,  v7.8h,  v5.8h
+        add             v6.8h,  v6.8h,  v2.8h       // 2*q1 + q0 + p0
+        add             v7.8h,  v7.8h,  v3.8h
+        rshrn           v2.8b,  v4.8h,  #2
+        rshrn2          v2.16b, v5.8h,  #2
+        rshrn           v3.8b,  v6.8h,  #2
+        rshrn2          v3.16b, v7.8h,  #2
+        mov             v28.16b, v24.16b
+        bsl             v28.16b, v2.16b, v3.16b     // q0 when filtered
+        mov             v31.16b, v22.16b
+        bsl             v31.16b, v28.16b, v19.16b   // new q0
+        mov             v28.16b, v24.16b
+        bsl             v28.16b, v3.16b, v20.16b    // new q1
+
+        mov             v17.16b, v30.16b
+        mov             v18.16b, v29.16b
+        mov             v19.16b, v31.16b
+        mov             v20.16b, v28.16b
+.endm
+
+/* build the 16 lane enable mask from bs1 (first 8) and bs2 (last 8) */
+.macro cavs_lf_bs_mask
+        cmp             w5, #0
+        csetm           x7, ne
+        cmp             w6, #0
+        csetm           x8, ne
+        mov             v27.d[0], x7
+        mov             v27.d[1], x8
+.endm
+
+
+/* the chroma enable mask: bs1 covers the first 4 lanes, bs2 the next 4 */
+.macro cavs_lf_bs_mask_c
+        cmp             w5, #0
+        csetm           w7, ne
+        cmp             w6, #0
+        csetm           w8, ne
+        orr             x7, x7, x8, lsl #32
+        mov             v27.d[0], x7
+.endm
+
+/* chroma variant of the bs < 2 filter (loop_filter_c1): 8 lanes,
+   p1/p0/q0/q1 in v17-v20, mask in v27; only p0/q0 are modified */
+.macro cavs_lf_c1_8
+        dup             v25.8b, w2
+        dup             v26.8b, w3
+        uabd            v22.8b, v18.8b, v19.8b
+        uabd            v23.8b, v17.8b, v18.8b
+        uabd            v24.8b, v20.8b, v19.8b
+        cmhi            v22.8b, v25.8b, v22.8b
+        cmhi            v23.8b, v26.8b, v23.8b
+        cmhi            v24.8b, v26.8b, v24.8b
+        and             v22.8b, v22.8b, v23.8b
+        and             v22.8b, v22.8b, v24.8b
+        and             v22.8b, v22.8b, v27.8b
+        usubl           v0.8h,  v19.8b, v18.8b      // q0 - p0
+        usubl           v2.8h,  v17.8b, v20.8b      // p1 - q1
+        shl             v4.8h,  v0.8h,  #1
+        add             v0.8h,  v0.8h,  v4.8h
+        add             v0.8h,  v0.8h,  v2.8h
+        srshr           v0.8h,  v0.8h,  #3
+        dup             v25.8h, w4
+        neg             v26.8h, v25.8h
+        smin            v0.8h,  v0.8h,  v25.8h
+        smax            v0.8h,  v0.8h,  v26.8h      // delta
+        uxtl            v2.8h,  v18.8b
+        add             v2.8h,  v2.8h,  v0.8h
+        sqxtun          v6.8b,  v2.8h
+        uxtl            v4.8h,  v19.8b
+        sub             v4.8h,  v4.8h,  v0.8h
+        sqxtun          v7.8b,  v4.8h
+        mov             v0.8b,  v22.8b
+        bsl             v0.8b,  v6.8b,  v18.8b
+        mov             v1.8b,  v22.8b
+        bsl             v1.8b,  v7.8b,  v19.8b
+        mov             v18.8b, v0.8b
+        mov             v19.8b, v1.8b
+.endm
+
+/* chroma variant of the bs == 2 filter (loop_filter_c2): 8 lanes,
+   p2..q2 in v16-v21; only p0/q0 are modified; w7 clobbered */
+.macro cavs_lf_c2_8
+        dup             v25.8b, w2
+        dup             v26.8b, w3
+        uabd            v28.8b, v18.8b, v19.8b      // |p0 - q0|
+        uabd            v23.8b, v17.8b, v18.8b
+        uabd            v24.8b, v20.8b, v19.8b
+        cmhi            v22.8b, v25.8b, v28.8b
+        cmhi            v23.8b, v26.8b, v23.8b
+        cmhi            v24.8b, v26.8b, v24.8b
+        and             v22.8b, v22.8b, v23.8b
+        and             v22.8b, v22.8b, v24.8b
+        lsr             w7, w2, #2
+        add             w7, w7, #2                  // (alpha >> 2) + 2
+        dup             v27.8b, w7
+        cmhi            v28.8b, v27.8b, v28.8b      // |p0 - q0| < alpha2
+        uabd            v23.8b, v16.8b, v18.8b      // |p2 - p0|
+        uabd            v24.8b, v21.8b, v19.8b      // |q2 - q0|
+        cmhi            v23.8b, v26.8b, v23.8b
+        cmhi            v24.8b, v26.8b, v24.8b
+        and             v23.8b, v23.8b, v28.8b
+        and             v24.8b, v24.8b, v28.8b
+        and             v23.8b, v23.8b, v22.8b      // strong p side
+        and             v24.8b, v24.8b, v22.8b      // strong q side
+        uaddl           v0.8h,  v18.8b, v19.8b      // p0 + q0
+        uxtl            v2.8h,  v17.8b              // p1
+        uxtl            v4.8h,  v18.8b              // p0
+        add             v6.8h,  v0.8h,  v2.8h
+        add             v28.8h, v6.8h,  v4.8h       // p1 + 2*p0 + q0
+        add             v30.8h, v6.8h,  v2.8h       // 2*p1 + p0 + q0
+        rshrn           v6.8b,  v28.8h, #2
+        rshrn           v7.8b,  v30.8h, #2
+        mov             v28.8b, v23.8b
+        bsl             v28.8b, v6.8b,  v7.8b
+        mov             v29.8b, v22.8b
+        bsl             v29.8b, v28.8b, v18.8b      // new p0
+        uxtl            v2.8h,  v20.8b              // q1
+        uxtl            v4.8h,  v19.8b              // q0
+        add             v6.8h,  v0.8h,  v2.8h
+        add             v4.8h,  v6.8h,  v4.8h       // q1 + 2*q0 + p0
+        add             v6.8h,  v6.8h,  v2.8h       // 2*q1 + q0 + p0
+        rshrn           v2.8b,  v4.8h,  #2
+        rshrn           v3.8b,  v6.8h,  #2
+        mov             v28.8b, v24.8b
+        bsl             v28.8b, v2.8b,  v3.8b
+        mov             v31.8b, v22.8b
+        bsl             v31.8b, v28.8b, v19.8b      // new q0
+        mov             v18.8b, v29.8b
+        mov             v19.8b, v31.8b
+.endm
+
+function ff_cavs_filter_lv_neon, export=1
+        cmp             w5, #2
+        b.eq            1f
+        orr             w7, w5, w6
+        cbz             w7, 9f
+1:
+        sub             x9, x0, #4
+        ld1             {v24.8b},   [x9], x1
+        ld1             {v16.8b},   [x9], x1
+        ld1             {v17.8b},   [x9], x1
+        ld1             {v18.8b},   [x9], x1
+        ld1             {v19.8b},   [x9], x1
+        ld1             {v20.8b},   [x9], x1
+        ld1             {v21.8b},   [x9], x1
+        ld1             {v25.8b},   [x9], x1
+        ld1             {v24.d}[1], [x9], x1
+        ld1             {v16.d}[1], [x9], x1
+        ld1             {v17.d}[1], [x9], x1
+        ld1             {v18.d}[1], [x9], x1
+        ld1             {v19.d}[1], [x9], x1
+        ld1             {v20.d}[1], [x9], x1
+        ld1             {v21.d}[1], [x9], x1
+        ld1             {v25.d}[1], [x9]
+
+        transpose_8x16B v24, v16, v17, v18, v19, v20, v21, v25, v28, v29
+
+        cmp             w5, #2
+        b.eq            2f
+        cavs_lf_bs_mask
+        cavs_lf_l1_16
+        b               3f
+2:
+        cavs_lf_l2_16
+3:
+        transpose_4x16B v17, v18, v19, v20, v28, v29, v30, v31
+
+        sub             x9, x0, #2
+        st1             {v17.s}[0], [x9], x1
+        st1             {v18.s}[0], [x9], x1
+        st1             {v19.s}[0], [x9], x1
+        st1             {v20.s}[0], [x9], x1
+        st1             {v17.s}[1], [x9], x1
+        st1             {v18.s}[1], [x9], x1
+        st1             {v19.s}[1], [x9], x1
+        st1             {v20.s}[1], [x9], x1
+        st1             {v17.s}[2], [x9], x1
+        st1             {v18.s}[2], [x9], x1
+        st1             {v19.s}[2], [x9], x1
+        st1             {v20.s}[2], [x9], x1
+        st1             {v17.s}[3], [x9], x1
+        st1             {v18.s}[3], [x9], x1
+        st1             {v19.s}[3], [x9], x1
+        st1             {v20.s}[3], [x9]
+9:
+        ret
+endfunc
+
+function ff_cavs_filter_lh_neon, export=1
+        cmp             w5, #2
+        b.eq            1f
+        orr             w7, w5, w6
+        cbz             w7, 9f
+1:
+        sub             x9, x0, x1
+        sub             x9, x9, x1, lsl #1          // d - 3 * stride
+        ld1             {v16.16b}, [x9], x1         // p2
+        ld1             {v17.16b}, [x9], x1         // p1
+        ld1             {v18.16b}, [x9], x1         // p0
+        ld1             {v19.16b}, [x9], x1         // q0
+        ld1             {v20.16b}, [x9], x1         // q1
+        ld1             {v21.16b}, [x9]             // q2
+
+        cmp             w5, #2
+        b.eq            2f
+        cavs_lf_bs_mask
+        cavs_lf_l1_16
+        b               3f
+2:
+        cavs_lf_l2_16
+3:
+        sub             x9, x0, x1, lsl #1
+        st1             {v17.16b}, [x9], x1
+        st1             {v18.16b}, [x9], x1
+        st1             {v19.16b}, [x9], x1
+        st1             {v20.16b}, [x9]
+9:
+        ret
+endfunc
+
+function ff_cavs_filter_cv_neon, export=1
+        cmp             w5, #2
+        b.eq            1f
+        orr             w7, w5, w6
+        cbz             w7, 9f
+1:
+        sub             x9, x0, #4
+        ld1             {v24.8b}, [x9], x1
+        ld1             {v16.8b}, [x9], x1
+        ld1             {v17.8b}, [x9], x1
+        ld1             {v18.8b}, [x9], x1
+        ld1             {v19.8b}, [x9], x1
+        ld1             {v20.8b}, [x9], x1
+        ld1             {v21.8b}, [x9], x1
+        ld1             {v25.8b}, [x9]
+
+        transpose_8x8B  v24, v16, v17, v18, v19, v20, v21, v25, v28, v29
+
+        cmp             w5, #2
+        b.eq            2f
+        cavs_lf_bs_mask_c
+        cavs_lf_c1_8
+        b               3f
+2:
+        cavs_lf_c2_8
+3:
+        zip1            v0.16b, v18.16b, v19.16b
+
+        sub             x9, x0, #1
+        st1             {v0.h}[0], [x9], x1
+        st1             {v0.h}[1], [x9], x1
+        st1             {v0.h}[2], [x9], x1
+        st1             {v0.h}[3], [x9], x1
+        st1             {v0.h}[4], [x9], x1
+        st1             {v0.h}[5], [x9], x1
+        st1             {v0.h}[6], [x9], x1
+        st1             {v0.h}[7], [x9]
+9:
+        ret
+endfunc
+
+function ff_cavs_filter_ch_neon, export=1
+        cmp             w5, #2
+        b.eq            1f
+        orr             w7, w5, w6
+        cbz             w7, 9f
+1:
+        sub             x9, x0, x1
+        sub             x9, x9, x1, lsl #1          // d - 3 * stride
+        ld1             {v16.8b}, [x9], x1          // p2
+        ld1             {v17.8b}, [x9], x1          // p1
+        ld1             {v18.8b}, [x9], x1          // p0
+        ld1             {v19.8b}, [x9], x1          // q0
+        ld1             {v20.8b}, [x9], x1          // q1
+        ld1             {v21.8b}, [x9]              // q2
+
+        cmp             w5, #2
+        b.eq            2f
+        cavs_lf_bs_mask_c
+        cavs_lf_c1_8
+        b               3f
+2:
+        cavs_lf_c2_8
+3:
+        sub             x9, x0, x1
+        st1             {v18.8b}, [x9], x1
+        st1             {v19.8b}, [x9]
+9:
+        ret
+endfunc
