@@ -2132,10 +2132,13 @@ static int decode_seq_header(AVSContext *h)
     int frame_rate_code;
     int width, height;
     int mb_width, mb_height;
+    int chroma_format, sample_precision;
     int ret;
 
     h->profile = get_bits(&h->gb, 8);
-    if (h->profile != AV_PROFILE_CAVS_JIZHUN) {
+    /* the sequence header is the same for both profiles (table 14) */
+    if (h->profile != AV_PROFILE_CAVS_JIZHUN &&
+        h->profile != AV_PROFILE_CAVS_GUANGDIAN) {
         avpriv_report_missing_feature(h->avctx, "Profile %#x", h->profile);
         return AVERROR_PATCHWELCOME;
     }
@@ -2154,8 +2157,27 @@ static int decode_seq_header(AVSContext *h)
         av_log(h->avctx, AV_LOG_ERROR, "Dimensions invalid\n");
         return AVERROR_INVALIDDATA;
     }
-    skip_bits(&h->gb, 2); //chroma format
-    skip_bits(&h->gb, 3); //sample_precision
+    chroma_format    = get_bits(&h->gb, 2);
+    sample_precision = get_bits(&h->gb, 3);
+    /* Only 8 bit 4:2:0 is implemented; 4:2:2 changes the macroblock layer
+     * (tables 25, 42). JiZhun samples predate the two fields being used in
+     * earnest and keep being decoded as 8 bit 4:2:0 regardless. */
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN) {
+        if (sample_precision != 1) {
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "sample_precision %d is not 8 bit\n", sample_precision);
+            return AVERROR_INVALIDDATA;
+        }
+        if (chroma_format == 2) {
+            avpriv_request_sample(h->avctx, "4:2:2 chroma");
+            return AVERROR_PATCHWELCOME;
+        }
+        if (chroma_format != 1) {
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "chroma_format %d is reserved\n", chroma_format);
+            return AVERROR_INVALIDDATA;
+        }
+    }
     h->aspect_ratio = get_bits(&h->gb, 4);
     frame_rate_code = get_bits(&h->gb, 4);
     if (frame_rate_code == 0 || frame_rate_code > 13) {
@@ -2445,7 +2467,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
 
 const FFCodec ff_cavs_decoder = {
     .p.name         = "cavs",
-    CODEC_LONG_NAME("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile)"),
+    CODEC_LONG_NAME("Chinese AVS (Audio Video Standard) (AVS1-P2 JiZhun, AVS1-P16 GuangDian profiles)"),
     .p.type         = AVMEDIA_TYPE_VIDEO,
     .p.id           = AV_CODEC_ID_CAVS,
     .priv_data_size = sizeof(AVSContext),
