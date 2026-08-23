@@ -929,15 +929,22 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
 
 static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
 {
+    int mby = h->stc;
+
     if (h->stc > 0xAF)
         av_log(h->avctx, AV_LOG_ERROR, "unexpected start code 0x%02x\n", h->stc);
 
-    if (h->stc >= h->mb_height) {
-        av_log(h->avctx, AV_LOG_ERROR, "stc 0x%02x is too large\n", h->stc);
+    /* pictures over 2800 lines carry the high bits of MbRow separately
+     * (table 25, clause 7.2.4) */
+    if (h->height > 2800)
+        mby += get_bits(gb, 3) << 7; //slice_vertical_position_extension
+
+    if (mby >= h->mb_height) {
+        av_log(h->avctx, AV_LOG_ERROR, "MbRow %d is too large\n", mby);
         return AVERROR_INVALIDDATA;
     }
 
-    h->mby   = h->stc;
+    h->mby   = mby;
     h->mbidx = h->mby * h->mb_width;
 
     /* mark top macroblocks as unavailable */
@@ -969,10 +976,16 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
     return 0;
 }
 
+/**
+ * Look for a slice start code at the current position and parse its header.
+ * @return 1 when a new slice was entered, 0 otherwise, a negative error
+ *         code when its header is invalid
+ */
 static inline int check_for_slice(AVSContext *h)
 {
     GetBitContext *gb = &h->gb;
     int align;
+    int ret;
 
     if (h->mbx)
         return 0;
@@ -985,7 +998,9 @@ static inline int check_for_slice(AVSContext *h)
         h->stc = get_bits(gb, 8);
         if (h->stc >= h->mb_height)
             return 0;
-        decode_slice_header(h, gb);
+        ret = decode_slice_header(h, gb);
+        if (ret < 0)
+            return ret;
         return 1;
     }
     return 0;
@@ -1114,14 +1129,19 @@ static int decode_pic(AVSContext *h)
     ret = 0;
     if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
         do {
-            check_for_slice(h);
+            ret = check_for_slice(h);
+            if (ret < 0)
+                break;
             ret = decode_mb_i(h, 0);
             if (ret < 0)
                 break;
         } while (ff_cavs_next_mb(h));
     } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_P) {
         do {
-            if (check_for_slice(h))
+            ret = check_for_slice(h);
+            if (ret < 0)
+                break;
+            if (ret)
                 skip_count = -1;
             if (h->skip_mode_flag && (skip_count < 0)) {
                 if (get_bits_left(&h->gb) < 1) {
@@ -1148,7 +1168,10 @@ static int decode_pic(AVSContext *h)
         } while (ff_cavs_next_mb(h));
     } else { /* AV_PICTURE_TYPE_B */
         do {
-            if (check_for_slice(h))
+            ret = check_for_slice(h);
+            if (ret < 0)
+                break;
+            if (ret)
                 skip_count = -1;
             if (h->skip_mode_flag && (skip_count < 0)) {
                 if (get_bits_left(&h->gb) < 1) {
