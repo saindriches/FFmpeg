@@ -177,6 +177,7 @@ typedef struct AVSContext {
     AVSFrame DPB[2];  ///< reference frames
     int dist[2];     ///< temporal distances from current frame to ref frames
     int low_delay;
+    int progressive_seq;
     int profile, level;
     int aspect_ratio;
     int mb_width, mb_height;
