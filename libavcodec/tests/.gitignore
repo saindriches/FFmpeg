@@ -5,6 +5,7 @@
 /bitstream_be
 /bitstream_le
 /cabac
+/cavs_aec
 /celp_math
 /codec_desc
 /dct
