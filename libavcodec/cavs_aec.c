@@ -1,0 +1,227 @@
+/*
+ * Chinese AVS video (AVS1-P16, GuangDian profile) AEC arithmetic decoder
+ * Copyright (c) 2026 Rainbaby <rainbaby@outlook.jp>
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/**
+ * @file
+ * Advanced entropy coding (AEC) arithmetic decoding engine used by the
+ * GuangDian profile of Chinese AVS video (AVS1-P16, "AVS+").
+ *
+ * Clause numbers without a prefix refer to GY/T 257.1-2012; "GB" prefixed
+ * ones to GB/T 20090.16-2016, whose clause 8.4 is word for word the same.
+ *
+ * This implements the equivalent Annex E formulation of GB/T 20090.16-2016
+ * (E.1 requires it whole): unlike the main body's renormalisation loops it
+ * bounds the bits read on truncated input, via bFlag and boundS. On a well
+ * formed bitstream bFlag stays 0 and the two formulations decode the same
+ * bins. The caller must have removed the annex A escapes from the payload.
+ */
+
+#include <stdint.h>
+
+#include "libavutil/avassert.h"
+#include "libavutil/macros.h"
+
+#include "cavs_aec.h"
+#include "get_bits.h"
+
+/** 8.4.2.1: initial value of lgPmps, i.e. P(LPS) = 1/2. */
+#define CAVS_AEC_LGPMPS_INIT 1023
+/** 8.4.4.3.5: lgPmps saturation limit tested after the LPS increment. */
+#define CAVS_AEC_LGPMPS_MAX 1023
+/** 8.4.4.3.5: lgPmps is reflected through this value when the MPS flips. */
+#define CAVS_AEC_LGPMPS_REFLECT 2047
+/** 8.4.4.3.3: decode_bypass hard codes lgPmps to 1023. */
+#define CAVS_AEC_LGPMPS_BYPASS 1023
+/** 8.4.4.3.4: decode_aec_stuffing_bit hard codes lgPmps to 4. */
+#define CAVS_AEC_LGPMPS_STUFF 4
+/** 8.4.2.2: initial value of rT1. */
+#define CAVS_AEC_RT1_INIT 0xFF
+/** GB E.2: boundS, the cap on valueS that bounds both renormalisation loops. */
+#define CAVS_AEC_BOUND_S 0xFE
+
+/** Adapt one context model after a bin has been decoded, 8.4.4.3.5. */
+static void cavs_aec_update_ctx(CAVSAECModel *m, int bin)
+{
+    /* cwr from cycno before the update; entries 3..5 of lps_inc_tab are the
+     * standard's switch (cwr), the rest only pad it so cwr indexes it */
+    static const uint8_t  cwr_tab[4]     = { 3, 3, 4, 5 };
+    static const uint16_t lps_inc_tab[6] = { 0, 0, 0, 197, 95, 46 };
+    const int cwr = cwr_tab[m->cycno];
+
+    if (bin != m->mps)
+        m->cycno = FFMIN(m->cycno + 1, 3);
+    else if (m->cycno == 0)
+        m->cycno = 1;
+
+    if (bin == m->mps) {
+        /* log domain decay; both shifts reach 0 for small lgPmps, so
+         * lgPmps never falls below 7 */
+        m->lg_pmps -= (m->lg_pmps >> cwr) + (m->lg_pmps >> (cwr + 2));
+    } else {
+        m->lg_pmps += lps_inc_tab[cwr];
+        if (m->lg_pmps > CAVS_AEC_LGPMPS_MAX) {
+            /* the MPS flips; 1023 + 197 reflects back inside [0,1023] */
+            m->lg_pmps = CAVS_AEC_LGPMPS_REFLECT - m->lg_pmps;
+            m->mps    ^= 1;
+        }
+    }
+}
+
+/** Decode one bin (GB E.3/E.4/E.5); the bodies of 8.4.4.3.2 to 8.4.4.3.4
+    are identical, the callers supply predMps and lgPmps. */
+static int cavs_aec_decode_bin(CAVSAECContext *aec, int pred_mps, int lg_pmps)
+{
+    GetBitContext *gb = aec->gb;
+    /* LPS width in rT1 units; lgPmps >= 4, so never 0, bounding the loops */
+    const int lps_range = lg_pmps >> 2;
+    int rs2, rt2, s_flag, bin;
+
+    av_assert2(lps_range > 0);
+
+    if (aec->rt1 >= lps_range) {
+        rs2    = aec->rs1;
+        rt2    = aec->rt1 - lps_range;
+        s_flag = 0;
+    } else {
+        rs2    = aec->rs1 + 1;
+        rt2    = 256 + aec->rt1 - lps_range;
+        s_flag = 1;
+    }
+
+    /* with bFlag set (offset window exhausted, Annex E) the engine emits
+     * MPS bins instead of consuming past the end of the buffer */
+    if ((rs2 > aec->value_s ||
+         (rs2 == aec->value_s && aec->value_t >= rt2)) && !aec->b_flag) {
+        int t_rlps = s_flag ? aec->rt1 + lps_range : lps_range;
+
+        bin = !pred_mps;
+        if (rs2 == aec->value_s)
+            aec->value_t = aec->value_t - rt2;
+        else
+            aec->value_t = 256 + ((aec->value_t << 1) | get_bits1(gb)) - rt2;
+        /* renormalise; t_rlps is in [1,510], so at most 8 iterations */
+        while (t_rlps < 0x100) {
+            t_rlps       = t_rlps << 1;
+            aec->value_t = (aec->value_t << 1) | get_bits1(gb);
+        }
+        aec->rt1 = t_rlps & 0xFF;
+    } else {
+        bin      = pred_mps;
+        aec->rs1 = rs2;
+        aec->rt1 = rt2;
+    }
+
+    /* renormalise the offset, skipping leading zeroes into value_s */
+    if (bin != pred_mps || (aec->b_flag && rs2 == CAVS_AEC_BOUND_S)) {
+        aec->rs1     = 0;
+        aec->value_s = 0;
+        while (aec->value_t < 0x100 && aec->value_s < CAVS_AEC_BOUND_S) {
+            aec->value_s++;
+            aec->value_t = (aec->value_t << 1) | get_bits1(gb);
+        }
+        aec->b_flag   = aec->value_t < 0x100;
+        aec->value_t &= 0xFF;
+    }
+
+    return bin;
+}
+
+void ff_cavs_aec_init(CAVSAECContext *aec, GetBitContext *gb)
+{
+    int i;
+
+    /* 8.4.2.1: every context model starts from the same triple */
+    for (i = 0; i < CAVS_AEC_NUM_CTX; i++) {
+        aec->ctx[i].mps     = 0;
+        aec->ctx[i].cycno   = 0;
+        aec->ctx[i].lg_pmps = CAVS_AEC_LGPMPS_INIT;
+    }
+
+    /* 8.4.2.2 / GB E.2 */
+    aec->gb      = gb;
+    aec->rs1     = 0;
+    aec->rt1     = CAVS_AEC_RT1_INIT;
+    aec->value_s = 0;
+    aec->value_t = get_bits(gb, 9);
+    while (!((aec->value_t >> 8) & 0x01) && aec->value_s < CAVS_AEC_BOUND_S) {
+        aec->value_t = (aec->value_t << 1) | get_bits1(gb);
+        aec->value_s++;
+    }
+    aec->b_flag   = aec->value_t < 0x100;
+    aec->value_t &= 0xFF;
+}
+
+int ff_cavs_aec_decode_decision(CAVSAECContext *aec, int ctx_idx)
+{
+    CAVSAECModel *m;
+    int bin;
+
+    /* bitstream derived indices have been checked by ff_cavs_aec_ctx_idx() */
+    av_assert2(ctx_idx >= 0 && ctx_idx < CAVS_AEC_NUM_CTX);
+
+    m   = &aec->ctx[ctx_idx];
+    bin = cavs_aec_decode_bin(aec, m->mps, m->lg_pmps);
+    cavs_aec_update_ctx(m, bin);
+
+    return bin;
+}
+
+int ff_cavs_aec_decode_decision_w(CAVSAECContext *aec, int ctx_idx,
+                                  int ctx_idx_w)
+{
+    CAVSAECModel *m1, *m2;
+    int pred_mps, lg_pmps, bin;
+
+    av_assert2(ctx_idx   >= 0 && ctx_idx   < CAVS_AEC_NUM_CTX);
+    av_assert2(ctx_idx_w >= 0 && ctx_idx_w < CAVS_AEC_NUM_CTX);
+
+    m1 = &aec->ctx[ctx_idx];
+    m2 = &aec->ctx[ctx_idx_w];
+
+    /* 8.4.4.3.2, contextWeighting == 1 */
+    if (m1->mps == m2->mps) {
+        pred_mps = m1->mps;
+        lg_pmps  = (m1->lg_pmps + m2->lg_pmps) / 2;
+    } else if (m1->lg_pmps < m2->lg_pmps) {
+        pred_mps = m1->mps;
+        lg_pmps  = 1023 - ((m2->lg_pmps - m1->lg_pmps) >> 1);
+    } else {
+        /* also taken when the two lgPmps are equal */
+        pred_mps = m2->mps;
+        lg_pmps  = 1023 - ((m1->lg_pmps - m2->lg_pmps) >> 1);
+    }
+
+    bin = cavs_aec_decode_bin(aec, pred_mps, lg_pmps);
+    cavs_aec_update_ctx(m1, bin);
+    cavs_aec_update_ctx(m2, bin);
+
+    return bin;
+}
+
+int ff_cavs_aec_decode_bypass(CAVSAECContext *aec)
+{
+    return cavs_aec_decode_bin(aec, 0, CAVS_AEC_LGPMPS_BYPASS);
+}
+
+int ff_cavs_aec_decode_stuffing_bit(CAVSAECContext *aec)
+{
+    return cavs_aec_decode_bin(aec, 0, CAVS_AEC_LGPMPS_STUFF);
+}

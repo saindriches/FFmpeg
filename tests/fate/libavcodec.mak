@@ -28,6 +28,11 @@ fate-cabac: libavcodec/tests/cabac$(EXESUF)
 fate-cabac: CMD = run libavcodec/tests/cabac$(EXESUF)
 fate-cabac: CMP = null
 
+FATE_LIBAVCODEC-$(CONFIG_CAVS_DECODER) += fate-cavs-aec
+fate-cavs-aec: libavcodec/tests/cavs_aec$(EXESUF)
+fate-cavs-aec: CMD = run libavcodec/tests/cavs_aec$(EXESUF)
+fate-cavs-aec: CMP = null
+
 FATE_LIBAVCODEC-$(CONFIG_CELP_MATH) += fate-celp_math
 fate-celp_math: libavcodec/tests/celp_math$(EXESUF)
 fate-celp_math: CMD = run libavcodec/tests/celp_math$(EXESUF)
