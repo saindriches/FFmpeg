@@ -144,20 +144,17 @@ static av_always_inline int cavs_aec_decode_bin(CAVSAECContext *aec,
 
     av_assert2(lps_range > 0);
 
-    if (aec->rt1 >= lps_range) {
-        rs2    = aec->rs1;
-        rt2    = aec->rt1 - lps_range;
-        s_flag = 0;
-    } else {
-        rs2    = aec->rs1 + 1;
-        rt2    = 256 + aec->rt1 - lps_range;
-        s_flag = 1;
-    }
+    s_flag = aec->rt1 < lps_range;
+    rs2    = aec->rs1 + s_flag;
+    rt2    = (s_flag << 8) + aec->rt1 - lps_range;
 
     /* with bFlag set (offset window exhausted, Annex E) the engine emits
-     * MPS bins instead of consuming past the end of the buffer */
-    if ((rs2 > aec->value_s ||
-         (rs2 == aec->value_s && aec->value_t >= rt2)) && !aec->b_flag) {
+     * MPS bins instead of consuming past the end of the buffer. The
+     * two term compare of the standard collapses to one: with rt2 in
+     * [0, 510] and valueT in [0, 255], rS2 > valueS or (equal and
+     * valueT >= rT2) is exactly (rS2 << 9) - rT2 >= (valueS << 9) - valueT */
+    if (!aec->b_flag &&
+        (rs2 << 9) - rt2 >= (aec->value_s << 9) - aec->value_t) {
         int t_rlps = s_flag ? aec->rt1 + lps_range : lps_range;
         /* renormalisation shift; t_rlps is in [1,510], so n is in [0,8] */
         int n = t_rlps < 0x100 ? 8 - av_log2(t_rlps) : 0;
