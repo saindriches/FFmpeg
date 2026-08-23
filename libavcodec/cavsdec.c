@@ -946,12 +946,25 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
         h->qp_fixed = get_bits1(gb);
         h->qp       = get_bits(gb, 6);
     }
-    /* inter frame or second slice can have weighting params */
+    /* second field slices of an intra picture carry the flag too */
     if ((h->cur.f->pict_type != AV_PICTURE_TYPE_I) ||
-        (!h->pic_structure && h->mby >= h->mb_width / 2))
+        (!h->pic_structure && h->mbidx >= h->mb_width * h->mb_height / 2))
         if (get_bits1(gb)) { //slice_weighting_flag
-            av_log(h->avctx, AV_LOG_ERROR,
-                   "weighted prediction not yet supported\n");
+            /* NumberOfReference, clause 9.4.5 */
+            int nref = h->cur.f->pict_type == AV_PICTURE_TYPE_I ? 1 :
+                       h->pic_structure ? 2 : 4;
+            int i;
+
+            for (i = 0; i < nref; i++) {
+                skip_bits(gb, 8);  //luma_scale
+                skip_bits(gb, 8);  //luma_shift
+                skip_bits1(gb);    //marker_bit
+                skip_bits(gb, 8);  //chroma_scale
+                skip_bits(gb, 8);  //chroma_shift
+                skip_bits1(gb);    //marker_bit
+            }
+            skip_bits1(gb);        //mb_weighting_flag
+            avpriv_request_sample(h->avctx, "Weighted prediction");
         }
     return 0;
 }
