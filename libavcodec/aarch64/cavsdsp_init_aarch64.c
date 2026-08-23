@@ -30,6 +30,15 @@
 
 void ff_cavs_idct8_add_neon(uint8_t *dst, int16_t *block, ptrdiff_t stride);
 
+void ff_cavs_filter_lv_neon(uint8_t *d, ptrdiff_t stride, int alpha, int beta,
+                            int tc, int bs1, int bs2);
+void ff_cavs_filter_lh_neon(uint8_t *d, ptrdiff_t stride, int alpha, int beta,
+                            int tc, int bs1, int bs2);
+void ff_cavs_filter_cv_neon(uint8_t *d, ptrdiff_t stride, int alpha, int beta,
+                            int tc, int bs1, int bs2);
+void ff_cavs_filter_ch_neon(uint8_t *d, ptrdiff_t stride, int alpha, int beta,
+                            int tc, int bs1, int bs2);
+
 av_cold void ff_cavsdsp_init_aarch64(CAVSDSPContext *c)
 {
     int cpu_flags = av_get_cpu_flags();
@@ -37,5 +46,9 @@ av_cold void ff_cavsdsp_init_aarch64(CAVSDSPContext *c)
     if (have_neon(cpu_flags)) {
         c->cavs_idct8_add = ff_cavs_idct8_add_neon;
         c->idct_perm      = FF_IDCT_PERM_TRANSPOSE;
+        c->cavs_filter_lv = ff_cavs_filter_lv_neon;
+        c->cavs_filter_lh = ff_cavs_filter_lh_neon;
+        c->cavs_filter_cv = ff_cavs_filter_cv_neon;
+        c->cavs_filter_ch = ff_cavs_filter_ch_neon;
     }
 }
