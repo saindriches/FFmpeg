@@ -595,3 +595,281 @@ function ff_cavs_filter_ch_neon, export=1
 9:
         ret
 endfunc
+
+/*
+ * Sub sample interpolation (clause 9.9.2.2/9.9.2.3), the one dimensional
+ * positions. The half sample filter (-1, 5, 5, -1) fits signed 16 bit
+ * lanes as it stands; the quarter sample filters reach (96 + 42) * 255,
+ * so like the SSE2 version they accumulate the positive and negative
+ * taps separately in unsigned 16 bit lanes and combine with a saturating
+ * subtract, which equals the C crop for every input. Loads may read up
+ * to 3 bytes past the last used sample, like the h264 qpel NEON code.
+ */
+
+/* one 8 wide row of the h half sample filter; input v0 = 16 bytes from
+   src - 2, result in \d (8 bytes) */
+.macro cavs_h_hpel_row d
+        ext             v1.16b, v0.16b, v0.16b, #1
+        ext             v2.16b, v0.16b, v0.16b, #2
+        ext             v3.16b, v0.16b, v0.16b, #3
+        ext             v4.16b, v0.16b, v0.16b, #4
+        uaddl           v5.8h,  v2.8b,  v3.8b
+        uaddl           v6.8h,  v1.8b,  v4.8b
+        shl             v7.8h,  v5.8h,  #2
+        add             v5.8h,  v5.8h,  v7.8h
+        sub             v5.8h,  v5.8h,  v6.8h
+        sqrshrun        \d\().8b, v5.8h, #3
+.endm
+
+/* one 8 wide row of the left/right quarter sample filter; \e2/\e3 are
+   the ext amounts of the two positive taps, \which selects the tap set */
+.macro cavs_h_qpel_row d, which
+        ext             v1.16b, v0.16b, v0.16b, #1
+        ext             v2.16b, v0.16b, v0.16b, #2
+        ext             v3.16b, v0.16b, v0.16b, #3
+        ext             v4.16b, v0.16b, v0.16b, #4
+.ifc \which, qpel_l
+        // (-1, -2, 96, 42, -7) at src - 2 .. src + 2
+        umull           v5.8h,  v2.8b,  v29.8b      // 96 * src0
+        umlal           v5.8h,  v3.8b,  v30.8b      // + 42 * src1
+        uaddl           v6.8h,  v0.8b,  v1.8b       // src-2 + src-1
+        uaddw           v6.8h,  v6.8h,  v1.8b       // + src-1
+        umlal           v6.8h,  v4.8b,  v31.8b      // + 7 * src2
+.else
+        // (-7, 42, 96, -2, -1) at src - 1 .. src + 3
+        ext             v7.16b, v0.16b, v0.16b, #5
+        umull           v5.8h,  v2.8b,  v30.8b      // 42 * src0
+        umlal           v5.8h,  v3.8b,  v29.8b      // + 96 * src1
+        umull           v6.8h,  v1.8b,  v31.8b      // 7 * src-1
+        uaddw           v6.8h,  v6.8h,  v4.8b       // + src2
+        uaddw           v6.8h,  v6.8h,  v4.8b       // + src2
+        uaddw           v6.8h,  v6.8h,  v7.8b       // + src3
+.endif
+        movi            v7.8h,  #64
+        add             v5.8h,  v5.8h,  v7.8h
+        uqsub           v5.8h,  v5.8h,  v6.8h       // clip at 0
+        ushr            v5.8h,  v5.8h,  #7
+        uqxtn           \d\().8b, v5.8h             // clip at 255
+.endm
+
+/* 8x8 horizontal filter bodies; \op is put or avg */
+.macro cavs_qpel8_h_fn type, op
+function \op\()_cavs_qpel8_h_\type\()_neon
+        sub             x1,  x1,  #2
+        mov             w10, #8
+1:      ld1             {v0.16b}, [x1], x2
+.ifc \type, hpel
+        cavs_h_hpel_row v16
+.else
+        cavs_h_qpel_row v16, \type
+.endif
+.ifc \op, avg
+        ld1             {v17.8b}, [x0]
+        urhadd          v16.8b, v16.8b, v17.8b
+.endif
+        st1             {v16.8b}, [x0], x2
+        subs            w10, w10, #1
+        b.ne            1b
+        ret
+endfunc
+.endm
+
+cavs_qpel8_h_fn hpel,   put
+cavs_qpel8_h_fn qpel_l, put
+cavs_qpel8_h_fn qpel_r, put
+cavs_qpel8_h_fn hpel,   avg
+cavs_qpel8_h_fn qpel_l, avg
+cavs_qpel8_h_fn qpel_r, avg
+
+/* 8x8 vertical filter bodies: a rolling window of source rows */
+.macro cavs_qpel8_v_fn type, op
+function \op\()_cavs_qpel8_v_\type\()_neon
+.ifc \type, hpel
+        sub             x9,  x1,  x2
+        ld1             {v0.8b}, [x9], x2           // r-1
+        ld1             {v1.8b}, [x9], x2           // r0
+        ld1             {v2.8b}, [x9], x2           // r1
+.endif
+.ifc \type, qpel_l
+        sub             x9,  x1,  x2,  lsl #1
+        ld1             {v0.8b}, [x9], x2           // r-2
+        ld1             {v1.8b}, [x9], x2           // r-1
+        ld1             {v2.8b}, [x9], x2           // r0
+        ld1             {v3.8b}, [x9], x2           // r1
+.endif
+.ifc \type, qpel_r
+        sub             x9,  x1,  x2
+        ld1             {v0.8b}, [x9], x2           // r-1
+        ld1             {v1.8b}, [x9], x2           // r0
+        ld1             {v2.8b}, [x9], x2           // r1
+        ld1             {v3.8b}, [x9], x2           // r2
+.endif
+        mov             w10, #8
+1:
+.ifc \type, hpel
+        ld1             {v3.8b}, [x9], x2           // r2
+        uaddl           v5.8h,  v1.8b,  v2.8b
+        uaddl           v6.8h,  v0.8b,  v3.8b
+        shl             v7.8h,  v5.8h,  #2
+        add             v5.8h,  v5.8h,  v7.8h
+        sub             v5.8h,  v5.8h,  v6.8h
+        sqrshrun        v16.8b, v5.8h,  #3
+.endif
+.ifc \type, qpel_l
+        ld1             {v4.8b}, [x9], x2           // r2
+        umull           v5.8h,  v2.8b,  v29.8b      // 96 * r0
+        umlal           v5.8h,  v3.8b,  v30.8b      // + 42 * r1
+        uaddl           v6.8h,  v0.8b,  v1.8b       // r-2 + r-1
+        uaddw           v6.8h,  v6.8h,  v1.8b       // + r-1
+        umlal           v6.8h,  v4.8b,  v31.8b      // + 7 * r2
+        movi            v7.8h,  #64
+        add             v5.8h,  v5.8h,  v7.8h
+        uqsub           v5.8h,  v5.8h,  v6.8h
+        ushr            v5.8h,  v5.8h,  #7
+        uqxtn           v16.8b, v5.8h
+.endif
+.ifc \type, qpel_r
+        ld1             {v4.8b}, [x9], x2           // r3
+        umull           v5.8h,  v1.8b,  v30.8b      // 42 * r0
+        umlal           v5.8h,  v2.8b,  v29.8b      // + 96 * r1
+        umull           v6.8h,  v0.8b,  v31.8b      // 7 * r-1
+        uaddw           v6.8h,  v6.8h,  v3.8b       // + r2
+        uaddw           v6.8h,  v6.8h,  v3.8b       // + r2
+        uaddw           v6.8h,  v6.8h,  v4.8b       // + r3
+        movi            v7.8h,  #64
+        add             v5.8h,  v5.8h,  v7.8h
+        uqsub           v5.8h,  v5.8h,  v6.8h
+        ushr            v5.8h,  v5.8h,  #7
+        uqxtn           v16.8b, v5.8h
+.endif
+.ifc \op, avg
+        ld1             {v17.8b}, [x0]
+        urhadd          v16.8b, v16.8b, v17.8b
+.endif
+        st1             {v16.8b}, [x0], x2
+        mov             v0.8b,  v1.8b
+        mov             v1.8b,  v2.8b
+        mov             v2.8b,  v3.8b
+.ifnc \type, hpel
+        mov             v3.8b,  v4.8b
+.endif
+        subs            w10, w10, #1
+        b.ne            1b
+        ret
+endfunc
+.endm
+
+cavs_qpel8_v_fn hpel,   put
+cavs_qpel8_v_fn qpel_l, put
+cavs_qpel8_v_fn qpel_r, put
+cavs_qpel8_v_fn hpel,   avg
+cavs_qpel8_v_fn qpel_l, avg
+cavs_qpel8_v_fn qpel_r, avg
+
+/* the quarter sample tap constants shared by all qpel entry points */
+.macro cavs_qpel_consts
+        movi            v29.8b, #96
+        movi            v30.8b, #42
+        movi            v31.8b, #7
+.endm
+
+/* exported 8x8 entry points */
+.macro cavs_qpel8_fn mc, core, op
+function ff_\op\()_cavs_qpel8_\mc\()_neon, export=1
+        cavs_qpel_consts
+        b               \op\()_cavs_qpel8_\core\()_neon
+endfunc
+.endm
+
+cavs_qpel8_fn mc20, h_hpel,   put
+cavs_qpel8_fn mc10, h_qpel_l, put
+cavs_qpel8_fn mc30, h_qpel_r, put
+cavs_qpel8_fn mc02, v_hpel,   put
+cavs_qpel8_fn mc01, v_qpel_l, put
+cavs_qpel8_fn mc03, v_qpel_r, put
+cavs_qpel8_fn mc20, h_hpel,   avg
+cavs_qpel8_fn mc10, h_qpel_l, avg
+cavs_qpel8_fn mc30, h_qpel_r, avg
+cavs_qpel8_fn mc02, v_hpel,   avg
+cavs_qpel8_fn mc01, v_qpel_l, avg
+cavs_qpel8_fn mc03, v_qpel_r, avg
+
+/* exported 16x16 entry points: the four 8x8 quadrants of the C code */
+.macro cavs_qpel16_fn mc, core, op
+function ff_\op\()_cavs_qpel16_\mc\()_neon, export=1
+        stp             x19, x20, [sp, #-32]!
+        stp             x21, x30, [sp, #16]
+        cavs_qpel_consts
+        mov             x19, x0
+        mov             x20, x1
+        mov             x21, x2
+        bl              \op\()_cavs_qpel8_\core\()_neon
+        add             x0,  x19, #8
+        add             x1,  x20, #8
+        mov             x2,  x21
+        bl              \op\()_cavs_qpel8_\core\()_neon
+        add             x0,  x19, x21, lsl #3
+        add             x1,  x20, x21, lsl #3
+        mov             x2,  x21
+        bl              \op\()_cavs_qpel8_\core\()_neon
+        add             x0,  x19, x21, lsl #3
+        add             x1,  x20, x21, lsl #3
+        add             x0,  x0,  #8
+        add             x1,  x1,  #8
+        mov             x2,  x21
+        bl              \op\()_cavs_qpel8_\core\()_neon
+        ldp             x21, x30, [sp, #16]
+        ldp             x19, x20, [sp], #32
+        ret
+endfunc
+.endm
+
+cavs_qpel16_fn mc20, h_hpel,   put
+cavs_qpel16_fn mc10, h_qpel_l, put
+cavs_qpel16_fn mc30, h_qpel_r, put
+cavs_qpel16_fn mc02, v_hpel,   put
+cavs_qpel16_fn mc01, v_qpel_l, put
+cavs_qpel16_fn mc03, v_qpel_r, put
+cavs_qpel16_fn mc20, h_hpel,   avg
+cavs_qpel16_fn mc10, h_qpel_l, avg
+cavs_qpel16_fn mc30, h_qpel_r, avg
+cavs_qpel16_fn mc02, v_hpel,   avg
+cavs_qpel16_fn mc01, v_qpel_l, avg
+cavs_qpel16_fn mc03, v_qpel_r, avg
+
+/* full sample copies (mc00) */
+function ff_put_cavs_qpel8_mc00_neon, export=1
+.rept 8
+        ld1             {v0.8b}, [x1], x2
+        st1             {v0.8b}, [x0], x2
+.endr
+        ret
+endfunc
+
+function ff_avg_cavs_qpel8_mc00_neon, export=1
+.rept 8
+        ld1             {v0.8b}, [x1], x2
+        ld1             {v1.8b}, [x0]
+        urhadd          v0.8b,  v0.8b,  v1.8b
+        st1             {v0.8b}, [x0], x2
+.endr
+        ret
+endfunc
+
+function ff_put_cavs_qpel16_mc00_neon, export=1
+.rept 16
+        ld1             {v0.16b}, [x1], x2
+        st1             {v0.16b}, [x0], x2
+.endr
+        ret
+endfunc
+
+function ff_avg_cavs_qpel16_mc00_neon, export=1
+.rept 16
+        ld1             {v0.16b}, [x1], x2
+        ld1             {v1.16b}, [x0]
+        urhadd          v0.16b, v0.16b, v1.16b
+        st1             {v0.16b}, [x0], x2
+.endr
+        ret
+endfunc
