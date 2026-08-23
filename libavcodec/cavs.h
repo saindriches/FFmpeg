@@ -244,6 +244,16 @@ typedef struct AVSContext {
 
     uint8_t *edge_emu_buffer;
 
+    /** picture payload with the annex A pseudo start code escapes removed,
+        allocated only for the pictures that carry one */
+    uint8_t *deemulated_buf;
+    unsigned int deemulated_buf_size; ///< allocated size of deemulated_buf
+    /** byte offsets in deemulated_buf at which a start code prefix of the
+        original payload begins; see is_start_code_offset() */
+    uint32_t *stc_offset;
+    unsigned int stc_offset_size; ///< allocated size of stc_offset
+    int nb_stc_offset;            ///< entries of stc_offset in use
+
     int got_keyframe;
     int16_t *block;
 } AVSContext;
