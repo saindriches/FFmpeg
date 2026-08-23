@@ -239,7 +239,6 @@ typedef struct AVSContext {
 
     /* scaling factors for MV prediction */
     int sym_factor;    ///< for scaling in symmetrical B block
-    int direct_den[2]; ///< for scaling in direct B block
     int scale_den[2];  ///< for scaling neighbouring MVs
 
     uint8_t *edge_emu_buffer;
