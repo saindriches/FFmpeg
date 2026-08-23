@@ -186,6 +186,7 @@ typedef struct AVSContext {
     int progressive;
     int pic_structure;
     int skip_mode_flag; ///< select between skip_count or one skip_flag per MB
+    int aec_enable;     ///< AVS1-P16 arithmetic coding of the macroblock layer
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
