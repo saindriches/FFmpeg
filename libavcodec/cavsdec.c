@@ -1314,10 +1314,8 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             //mpeg_decode_user_data(avctx, buf_ptr, input_size);
             break;
         default:
-            if (stc <= SLICE_MAX_START_CODE) {
-                init_get_bits(&h->gb, buf_ptr, input_size);
-                decode_slice_header(h, &h->gb);
-            }
+            /* Slice start codes are consumed by decode_pic() through
+             * check_for_slice(); the scan loop only walks over them again. */
             break;
         }
     }
