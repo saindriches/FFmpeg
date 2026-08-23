@@ -159,18 +159,21 @@ static av_always_inline int cavs_aec_decode_bin(CAVSAECContext *aec,
     if ((rs2 > aec->value_s ||
          (rs2 == aec->value_s && aec->value_t >= rt2)) && !aec->b_flag) {
         int t_rlps = s_flag ? aec->rt1 + lps_range : lps_range;
+        /* renormalisation shift; t_rlps is in [1,510], so n is in [0,8] */
+        int n = t_rlps < 0x100 ? 8 - av_log2(t_rlps) : 0;
 
         bin = !pred_mps;
-        if (rs2 == aec->value_s)
+        if (rs2 == aec->value_s) {
             aec->value_t = aec->value_t - rt2;
-        else
-            aec->value_t = 256 + ((aec->value_t << 1) | get_bits1(gb)) - rt2;
-        /* renormalise; t_rlps is in [1,510], so at most 8 iterations */
-        while (t_rlps < 0x100) {
-            t_rlps       = t_rlps << 1;
-            aec->value_t = (aec->value_t << 1) | get_bits1(gb);
+            if (n)
+                aec->value_t = (aec->value_t << n) | get_bits(gb, n);
+        } else {
+            /* the offset bit and the n renormalisation bits in one read */
+            unsigned in  = get_bits(gb, n + 1);
+            aec->value_t = ((256 + ((aec->value_t << 1) | (in >> n)) - rt2)
+                            << n) | (in & ((1 << n) - 1));
         }
-        aec->rt1 = t_rlps & 0xFF;
+        aec->rt1 = (t_rlps << n) & 0xFF;
     } else {
         bin      = pred_mps;
         aec->rs1 = rs2;
@@ -181,9 +184,19 @@ static av_always_inline int cavs_aec_decode_bin(CAVSAECContext *aec,
     if (bin != pred_mps || (aec->b_flag && rs2 == CAVS_AEC_BOUND_S)) {
         aec->rs1     = 0;
         aec->value_s = 0;
-        while (aec->value_t < 0x100 && aec->value_s < CAVS_AEC_BOUND_S) {
-            aec->value_s++;
-            aec->value_t = (aec->value_t << 1) | get_bits1(gb);
+        if (aec->value_t > 0 && aec->value_t < 0x100) {
+            /* the top set bit of valueT fixes the shift; the bits read
+             * cannot terminate the loop earlier than it does */
+            int n = 8 - av_log2(aec->value_t);
+
+            aec->value_s = n;
+            aec->value_t = (aec->value_t << n) | get_bits(gb, n);
+        } else if (!aec->value_t) {
+            /* rare: valueS counts the leading zeroes of the stream itself */
+            while (aec->value_t < 0x100 && aec->value_s < CAVS_AEC_BOUND_S) {
+                aec->value_s++;
+                aec->value_t = (aec->value_t << 1) | get_bits1(gb);
+            }
         }
         aec->b_flag   = aec->value_t < 0x100;
         aec->value_t &= 0xFF;
