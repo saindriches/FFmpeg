@@ -108,6 +108,23 @@ static void check_cavs_qpeldsp(void)
                     call_new(dst1, src1, stride);
                     if (memcmp(srcbuf0, srcbuf1, sizeof(srcbuf0)) || memcmp(dstbuf0, dstbuf1, sizeof(dstbuf0)))
                         fail();
+                    /*
+                     * The quarter sample filters weight neighbouring
+                     * samples by 96 and 42 against negative taps, so the
+                     * positive tap sum reaches (96 + 42) * 255 = 35190,
+                     * past INT16_MAX, when the positively weighted samples
+                     * are 255 and the negatively weighted ones are 0.  A
+                     * flat 255 source only reaches 255 * 128 = 32640 and
+                     * would miss it, so drive the taps to the extremes
+                     * independently.
+                     */
+                    for (int k = 0; k < (int)sizeof(srcbuf0); k++)
+                        srcbuf0[k] = srcbuf1[k] = (rnd() & 1) ? 0xFF : 0x00;
+                    randomize_buffers(dstbuf0, dstbuf1);
+                    call_ref(dst0, src0, stride);
+                    call_new(dst1, src1, stride);
+                    if (memcmp(srcbuf0, srcbuf1, sizeof(srcbuf0)) || memcmp(dstbuf0, dstbuf1, sizeof(dstbuf0)))
+                        fail();
                     bench_new(dst0, src0, stride);
                 }
             }
