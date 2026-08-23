@@ -85,6 +85,17 @@ static void OPNAME ## _cavs_qpel16_mc20_ ## XMM(uint8_t *dst, const uint8_t *src
 
 QPEL_CAVS_XMM(put, sse2)
 QPEL_CAVS_XMM(avg, sse2)
+
+#if ARCH_X86_64
+#define DEF_LOOP_FILTER(EDGE) \
+    void ff_cavs_filter_ ## EDGE ## _sse2(uint8_t *d, ptrdiff_t stride, int alpha, \
+                                          int beta, int tc, int bs1, int bs2);
+
+DEF_LOOP_FILTER(lv)
+DEF_LOOP_FILTER(lh)
+DEF_LOOP_FILTER(cv)
+DEF_LOOP_FILTER(ch)
+#endif
 #endif
 
 av_cold void ff_cavsdsp_init_x86(CAVSDSPContext *c)
@@ -121,6 +132,13 @@ av_cold void ff_cavsdsp_init_x86(CAVSDSPContext *c)
 
         c->cavs_idct8_add = cavs_idct8_add_sse2;
         c->idct_perm      = FF_IDCT_PERM_TRANSPOSE;
+
+#if ARCH_X86_64
+        c->cavs_filter_lv = ff_cavs_filter_lv_sse2;
+        c->cavs_filter_lh = ff_cavs_filter_lh_sse2;
+        c->cavs_filter_cv = ff_cavs_filter_cv_sse2;
+        c->cavs_filter_ch = ff_cavs_filter_ch_sse2;
+#endif
     }
 #endif
 }
