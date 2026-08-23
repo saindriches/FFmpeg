@@ -2428,8 +2428,15 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             if (!h->got_keyframe)
                 break;
             init_get_bits(&h->gb, buf_ptr, input_size);
-            /* GY/T 257.1-2012 annex A, normative for decoders */
-            ret = remove_pseudo_start_codes(h, buf_ptr, input_size);
+            /* GY/T 257.1-2012 annex A, normative for decoders.
+             *
+             * BYTES, and deliberately not `input_size`, which is a BIT count in
+             * this tree: `init_get_bits` above takes bits, where the upstream
+             * this patch was written against had already been restructured to
+             * hold bytes and call `init_get_bits8`. Handing the bit count to a
+             * byte-counted scan sent it eight times past the end of the buffer.
+             */
+            ret = remove_pseudo_start_codes(h, buf_ptr, (int)(buf_end - buf_ptr));
             if (ret < 0)
                 return ret;
             if (ret) {
