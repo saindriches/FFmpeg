@@ -29,6 +29,7 @@
 #include "libavutil/mem_internal.h"
 
 #include "avcodec.h"
+#include "cavs_aec.h"
 #include "cavsdsp.h"
 #include "blockdsp.h"
 #include "h264chroma.h"
@@ -187,6 +188,14 @@ typedef struct AVSContext {
     int pic_structure;
     int skip_mode_flag; ///< select between skip_count or one skip_flag per MB
     int aec_enable;     ///< AVS1-P16 arithmetic coding of the macroblock layer
+    CAVSAECContext aec; ///< AEC engine and context models, cl. 8.4
+    int prev_delta_qp;  ///< PreviousDeltaQP of cl. 9.4.8, an AEC context
+    int left_cbp;       ///< MbCBP of the macroblock to the left
+    uint8_t *top_cbp;   ///< MbCBP of the macroblock above, one per column
+    /** IntraChromaPredMode of the macroblock to the left, cl. 8.4.4.2 e) */
+    int left_c_pred_mode;
+    /** IntraChromaPredMode of the macroblock above, one per column */
+    uint8_t *top_c_pred_mode;
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
@@ -226,6 +235,10 @@ typedef struct AVSContext {
     int pic_qp_fixed;
     int cbp;
     uint8_t permutated_scantable[64];
+    /** inverse block scan method 2 of cl. 9.5.3 c), for field pictures */
+    uint8_t permutated_scantable_field[64];
+    /** the one of the two the current picture uses, selected in decode_pic() */
+    const uint8_t *scantable;
 
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */

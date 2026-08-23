@@ -529,7 +529,7 @@ static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
 {
     int round = 1 << (shift - 1);
     int pos = -1;
-    const uint8_t *scantab = h->permutated_scantable;
+    const uint8_t *scantab = h->scantable;
 
     /* inverse scan and dequantization */
     while (--coeff_num >= 0) {
@@ -593,26 +593,316 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
         level_buf[i] = level;
         run_buf[i]   = run;
     }
-    if ((ret = dequant(h, level_buf, run_buf, block, dequant_mul[qp],
-                      dequant_shift[qp], i)) < 0)
-        return ret;
-    h->cdsp.cavs_idct8_add(dst, block, stride);
+    ret = dequant(h, level_buf, run_buf, block, dequant_mul[qp],
+                  dequant_shift[qp], i);
+    if (ret >= 0)
+        h->cdsp.cavs_idct8_add(dst, block, stride);
+    /* dequant() writes coefficients before it can tell that a run is out
+     * of range, so the buffer has to be cleared on that path too */
     h->bdsp.clear_block(block);
-    return 0;
+    return ret;
 }
 
 
+/*****************************************************************************
+ *
+ * advanced entropy coding (AEC), GY/T 257.1-2012 clause 8.4
+ *
+ * The binarisations of tables 44 to 50 and the ctxIdxInc derivations of
+ * clause 8.4.4.2, on top of the arithmetic decoding engine of cavs_aec.c.
+ * Only the syntax elements an intra macroblock carries are implemented; the
+ * inter ones, mb_skip_run, mb_type, mb_part_type, mb_reference_index,
+ * mv_diff_x, mv_diff_y and weighting_prediction, are not.
+ *
+ ****************************************************************************/
+
+/* Table 51: start index of every ae(v) coded syntax element; an element
+ * owns the models up to the next start index */
+#define AEC_MB_SKIP_RUN               0
+#define AEC_MB_TYPE                   4
+#define AEC_MB_PART_TYPE             19
+#define AEC_INTRA_LUMA_PRED_MODE     22
+#define AEC_INTRA_CHROMA_PRED_MODE   26
+#define AEC_MB_REFERENCE_INDEX       30
+#define AEC_MV_DIFF_X                36
+#define AEC_MV_DIFF_Y                42
+#define AEC_CBP                      48
+#define AEC_MB_QP_DELTA              54
+#define AEC_COEFF_FRAME_LUMA         58
+#define AEC_COEFF_FRAME_CHROMA      124
+#define AEC_COEFF_FIELD_LUMA        190
+#define AEC_COEFF_FIELD_CHROMA      256
+#define AEC_WEIGHTING_PREDICTION    322
+
+/** context models owned by one trans_coefficient set, 14 + 32 + 20 */
+#define AEC_COEFF_NUM_CTX            66
+/** the coeffRun models of a trans_coefficient set start here */
+#define AEC_COEFF_RUN                46
+/** and there are priIdx * 4 + secIdx of them */
+#define AEC_COEFF_RUN_NUM_CTX        20
+
+/** Table 52, priIdx as a function of lMax, which saturates at 5. */
+static const uint8_t cavs_aec_pri_idx[6] = { 0, 1, 2, 3, 3, 4 };
+
+/** Decode intra_luma_pred_mode (table 47) and derive IntraLumaPredMode
+    from predIntraPredMode per clause 9.4.4.2 a). */
+static int aec_intra_luma_pred_mode(AVSContext *h, int pred)
+{
+    int v = 0;
+
+    while (v < 4 &&
+           !ff_cavs_aec_decode_decision(&h->aec, AEC_INTRA_LUMA_PRED_MODE + v))
+        v++;
+
+    if (v == 0)
+        return pred;
+    if (v == 4)
+        v = 0;
+    return v < pred ? v : v + 1;
+}
+
+/** Decode intra_chroma_pred_mode (table 48, 8.4.4.2 e)).
+    @return IntraChromaPredMode, 0 to 3 (table 60) */
+static int aec_intra_chroma_pred_mode(AVSContext *h)
+{
+    /* a and b of 8.4.4.2 e): the neighbour is available and not
+     * Intra_Chroma_DC (INTRA_C_LP here); non-intra neighbours hold 0 */
+    const int a = (h->flags & A_AVAIL) &&
+                  h->left_c_pred_mode != INTRA_C_LP;
+    const int b = (h->flags & B_AVAIL) &&
+                  h->top_c_pred_mode[h->mbx] != INTRA_C_LP;
+    int v;
+
+    if (!ff_cavs_aec_decode_decision(&h->aec,
+                                     AEC_INTRA_CHROMA_PRED_MODE + a + b))
+        v = 0;
+    else if (!ff_cavs_aec_decode_decision(&h->aec,
+                                          AEC_INTRA_CHROMA_PRED_MODE + 3))
+        v = 1;
+    else
+        v = 2 + ff_cavs_aec_decode_decision(&h->aec,
+                                            AEC_INTRA_CHROMA_PRED_MODE + 3);
+
+    h->left_c_pred_mode        = v;
+    h->top_c_pred_mode[h->mbx] = v;
+    return v;
+}
+
+/** Decode cbp (table 50, 8.4.4.2 h), clause 9.4.7).
+    @return MbCBP, a six bit mask over the block order numbers */
+static int aec_cbp(AVSContext *h)
+{
+    /* the neighbouring 8x8 block is available and has no coefficients */
+    const int left = (h->flags & A_AVAIL) ? ~h->left_cbp        : 0;
+    const int top  = (h->flags & B_AVAIL) ? ~h->top_cbp[h->mbx] : 0;
+    int cbp = 0;
+    int a, b;
+
+    a = (left >> 1) & 1;                        /* left macroblock, block 1 */
+    b = (top  >> 2) & 1;                        /* above macroblock, block 2 */
+    cbp |= ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + a + 2 * b) << 0;
+
+    a = ~cbp & 1;                               /* this macroblock, block 0 */
+    b = (top >> 3) & 1;                         /* above macroblock, block 3 */
+    cbp |= ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + a + 2 * b) << 1;
+
+    a = (left >> 3) & 1;                        /* left macroblock, block 3 */
+    b = ~cbp & 1;                               /* this macroblock, block 0 */
+    cbp |= ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + a + 2 * b) << 2;
+
+    a = (~cbp >> 2) & 1;                        /* this macroblock, block 2 */
+    b = (~cbp >> 1) & 1;                        /* this macroblock, block 1 */
+    cbp |= ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + a + 2 * b) << 3;
+
+    /* chroma suffix: "0" leaves both bits clear, "11" sets both, "100" and
+     * "101" set bit 4 and bit 5 respectively */
+    if (ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + 4)) {
+        if (ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + 5))
+            cbp |= 3 << 4;
+        else
+            cbp |= 1 << (4 + ff_cavs_aec_decode_decision(&h->aec, AEC_CBP + 5));
+    }
+
+    h->left_cbp        = cbp;
+    h->top_cbp[h->mbx] = cbp;
+    return cbp;
+}
+
+/** Decode mb_qp_delta (table 44 unary, 8.4.4.2 i)) and map the code
+    number to the signed delta of clause 9.4.8. */
+static int aec_mb_qp_delta(AVSContext *h, int *delta)
+{
+    int ctx = AEC_MB_QP_DELTA + (h->prev_delta_qp != 0);
+    int v   = 0;
+
+    while (!ff_cavs_aec_decode_decision(&h->aec, ctx)) {
+        v++;
+        ctx = AEC_MB_QP_DELTA + (v == 1 ? 2 : 3);
+        if (v > 64) {
+            av_log(h->avctx, AV_LOG_ERROR, "mb_qp_delta out of range\n");
+            return AVERROR_INVALIDDATA;
+        }
+    }
+
+    if (v)
+        v = (v & 1) ? (v + 1) / 2 : -((v + 1) / 2);
+    *delta = v;
+    return 0;
+}
+
+/**
+ * Decode the trans_coefficient pairs of one 8x8 block (8.4.4.2 j) and k),
+ * clause 9.5.2) and reconstruct it as the VLC path does.
+ * @param chroma selects the chroma half of the context sets of table 51
+ */
+static int decode_residual_block_aec(AVSContext *h, int chroma, int qp,
+                                     uint8_t *dst, ptrdiff_t stride)
+{
+    int16_t level_buf[65];
+    uint8_t run_buf[65];
+    int16_t *block = h->block;
+    int lmax = 0, pos = 0, i, base, ret;
+
+    /* table 51's "field mode" contexts are those of a field coded picture,
+     * the condition under which 9.5.3 c) selects inverse scan method 2 */
+    if (h->pic_structure)
+        base = chroma ? AEC_COEFF_FRAME_CHROMA : AEC_COEFF_FRAME_LUMA;
+    else
+        base = chroma ? AEC_COEFF_FIELD_CHROMA : AEC_COEFF_FIELD_LUMA;
+
+    for (i = 0; i < 65; i++) {
+        /* priIdx and pos are bitstream derived, so the increments they
+         * produce are bounded here, not only by the engine's assertions */
+        const int pri = cavs_aec_pri_idx[FFMIN(lmax, 5)];
+        int ctx_lvl = ff_cavs_aec_ctx_idx(base, AEC_COEFF_NUM_CTX,
+                                          pri * 3 - (pri != 0));
+        int ctx_run = ff_cavs_aec_ctx_idx(base + AEC_COEFF_RUN,
+                                          AEC_COEFF_RUN_NUM_CTX, pri * 4);
+        int abs_level, run_val;
+
+        if (ctx_lvl < 0 || ctx_run < 0)
+            return FFMIN(ctx_lvl, ctx_run);
+        /* the engine keeps emitting MPS bins once the buffer runs out */
+        if (get_bits_left(&h->gb) <= 0)
+            return AVERROR_INVALIDDATA;
+
+        /* coeffLevel, table 44 unary, secIdx per table 53 */
+        if (!lmax) {
+            abs_level = 0;
+            if (!ff_cavs_aec_decode_decision(&h->aec, ctx_lvl)) {
+                do {
+                    abs_level++;
+                    /* the increment below must not overflow level_buf[] */
+                    if (abs_level >= 32767) {
+                        av_log(h->avctx, AV_LOG_ERROR, "AbsLevel too large\n");
+                        return AVERROR_INVALIDDATA;
+                    }
+                } while (!ff_cavs_aec_decode_decision(&h->aec, ctx_lvl + 1));
+            }
+            abs_level++;                        /* clause 9.5.2 a) */
+        } else {
+            /* the one context weighted bin of the standard (8.4.4.2 j));
+             * ctxIdxIncW reduces to 14 + (pos >> 1) for pos 0..63 */
+            int ctx_w = ff_cavs_aec_ctx_idx(base, AEC_COEFF_NUM_CTX,
+                                            14 + (pos >> 1));
+            if (ctx_w < 0)
+                return ctx_w;
+            if (ff_cavs_aec_decode_decision_w(&h->aec, ctx_lvl, ctx_w))
+                break;                          /* AbsLevel 0, end of block */
+            abs_level = 1;
+            if (!ff_cavs_aec_decode_decision(&h->aec, ctx_lvl + 1)) {
+                do {
+                    abs_level++;
+                    if (abs_level > 32767) {
+                        av_log(h->avctx, AV_LOG_ERROR, "AbsLevel too large\n");
+                        return AVERROR_INVALIDDATA;
+                    }
+                } while (!ff_cavs_aec_decode_decision(&h->aec, ctx_lvl + 2));
+            }
+        }
+
+        /* coeffSign, bypass coded (8.4.4.1) */
+        if (ff_cavs_aec_decode_bypass(&h->aec))
+            level_buf[i] = -abs_level;
+        else
+            level_buf[i] = abs_level;
+
+        /* coeffRun, table 44 unary, secIdx per table 53 */
+        ctx_run += abs_level > 1 ? 2 : 0;
+        run_val  = 0;
+        if (!ff_cavs_aec_decode_decision(&h->aec, ctx_run)) {
+            do {
+                run_val++;
+                if (run_val > 64) {
+                    av_log(h->avctx, AV_LOG_ERROR, "RunVal too large\n");
+                    return AVERROR_INVALIDDATA;
+                }
+            } while (!ff_cavs_aec_decode_decision(&h->aec, ctx_run + 1));
+        }
+        run_buf[i] = run_val + 1;   //scan positions consumed, 9.5.3 b)
+
+        /* lMax and pos carried between pairs per their definitions in
+         * 8.4.4.2 j), reset per block */
+        lmax = FFMAX(lmax, abs_level);
+        pos  = FFMIN(pos + run_val + 1, 63);
+    }
+
+    ret = dequant(h, level_buf, run_buf, block, dequant_mul[qp],
+                  dequant_shift[qp], i);
+    if (ret >= 0)
+        h->cdsp.cavs_idct8_add(dst, block, stride);
+    h->bdsp.clear_block(block);
+    return ret;
+}
+
+
+/**
+ * Position the bitstream reader on the start code that ends an AEC slice:
+ * the engine reads ahead of the bin it is decoding, but holds at most one
+ * byte of look ahead in valueT, so the prefix is found by scanning from
+ * two bytes back. The scan does not consult h->stc_offset[], so on a
+ * de-emulated payload it can stop at a coincidental prefix; then
+ * check_for_slice() refuses the offset and the picture is aborted
+ * cleanly by the "AEC picture without a slice header" guard.
+ */
+static void aec_end_of_slice(AVSContext *h)
+{
+    GetBitContext *gb = &h->gb;
+    const uint8_t *buf = gb->buffer;
+    int size = gb->size_in_bits >> 3;
+    int i    = FFMAX((get_bits_count(gb) >> 3) - 2, 0);
+
+    /* the engine is done with the bitstream until the next slice header
+     * starts it again, which is what check_for_slice() waits for */
+    h->aec.gb = NULL;
+
+    for (; i + 2 < size; i++)
+        if (!buf[i] && !buf[i + 1] && buf[i + 2] == 1)
+            break;
+    if (init_get_bits8(gb, buf, size) >= 0)
+        skip_bits_long(gb, i * 8);
+}
+
 static inline int decode_residual_chroma(AVSContext *h)
 {
+    const int qp = ff_cavs_chroma_qp[h->qp];
+    int ret;
+
     if (h->cbp & (1 << 4)) {
-        int ret = decode_residual_block(h, &h->gb, chroma_dec, 0,
-                              ff_cavs_chroma_qp[h->qp], h->cu, h->c_stride);
+        if (h->aec_enable)
+            ret = decode_residual_block_aec(h, 1, qp, h->cu, h->c_stride);
+        else
+            ret = decode_residual_block(h, &h->gb, chroma_dec, 0, qp,
+                                        h->cu, h->c_stride);
         if (ret < 0)
             return ret;
     }
     if (h->cbp & (1 << 5)) {
-        int ret = decode_residual_block(h, &h->gb, chroma_dec, 0,
-                              ff_cavs_chroma_qp[h->qp], h->cv, h->c_stride);
+        if (h->aec_enable)
+            ret = decode_residual_block_aec(h, 1, qp, h->cv, h->c_stride);
+        else
+            ret = decode_residual_block(h, &h->gb, chroma_dec, 0, qp,
+                                        h->cv, h->c_stride);
         if (ret < 0)
             return ret;
     }
@@ -681,29 +971,54 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
         predpred = FFMIN(nA, nB);
         if (predpred == NOT_AVAIL) // if either is not available
             predpred = INTRA_L_LP;
-        if (!get_bits1(gb)) {
+        if (h->aec_enable) {
+            predpred = aec_intra_luma_pred_mode(h, predpred);
+        } else if (!get_bits1(gb)) {
             int rem_mode = get_bits(gb, 2);
             predpred     = rem_mode + (rem_mode >= predpred);
         }
         h->pred_mode_Y[pos] = predpred;
     }
-    pred_mode_uv = get_ue_golomb_31(gb);
-    if (pred_mode_uv > 6) {
-        av_log(h->avctx, AV_LOG_ERROR, "illegal intra chroma pred mode\n");
-        return AVERROR_INVALIDDATA;
+    if (h->aec_enable) {
+        pred_mode_uv = aec_intra_chroma_pred_mode(h);
+    } else {
+        pred_mode_uv = get_ue_golomb_31(gb);
+        if (pred_mode_uv > 6) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal intra chroma pred mode\n");
+            return AVERROR_INVALIDDATA;
+        }
     }
     ff_cavs_modify_mb_i(h, &pred_mode_uv);
 
     /* get coded block pattern */
-    if (h->cur.f->pict_type == AV_PICTURE_TYPE_I)
-        cbp_code = get_ue_golomb(gb);
-    if (cbp_code > 63U) {
-        av_log(h->avctx, AV_LOG_ERROR, "illegal intra cbp\n");
-        return AVERROR_INVALIDDATA;
+    if (h->aec_enable) {
+        /* under AEC cbp is present for an intra macroblock too and carries
+         * MbCBP itself (table 26, clause 9.4.7) */
+        h->cbp = aec_cbp(h);
+    } else {
+        if (h->cur.f->pict_type == AV_PICTURE_TYPE_I)
+            cbp_code = get_ue_golomb(gb);
+        if (cbp_code > 63U) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal intra cbp\n");
+            return AVERROR_INVALIDDATA;
+        }
+        h->cbp = cbp_tab[cbp_code][0];
     }
-    h->cbp = cbp_tab[cbp_code][0];
-    if (h->cbp && !h->qp_fixed)
+    if (h->aec_enable) {
+        int delta = 0;
+
+        if (h->cbp && !h->qp_fixed) {
+            ret = aec_mb_qp_delta(h, &delta);
+            if (ret < 0)
+                return ret;
+            h->qp = (h->qp + (unsigned)delta) & 63;
+        }
+        /* a macroblock without mb_qp_delta resets PreviousDeltaQP:
+         * CurrentQP == PreviousQP means mbQpDelta 0 (clause 9.4.8) */
+        h->prev_delta_qp = delta;
+    } else if (h->cbp && !h->qp_fixed) {
         h->qp = (h->qp + (unsigned)get_se_golomb(gb)) & 63; //qp_delta
+    }
 
     /* luma intra prediction interleaved with residual decode/transform/add */
     for (block = 0; block < 4; block++) {
@@ -712,7 +1027,11 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
         h->intra_pred_l[h->pred_mode_Y[scan3x3[block]]]
             (d, top, left, h->l_stride);
         if (h->cbp & (1<<block)) {
-            ret = decode_residual_block(h, gb, intra_dec, 1, h->qp, d, h->l_stride);
+            if (h->aec_enable)
+                ret = decode_residual_block_aec(h, 0, h->qp, d, h->l_stride);
+            else
+                ret = decode_residual_block(h, gb, intra_dec, 1, h->qp, d,
+                                            h->l_stride);
             if (ret < 0)
                 return ret;
         }
@@ -1011,6 +1330,11 @@ static inline int check_for_slice(AVSContext *h)
 
     if (h->mbx)
         return 0;
+    /* until aec_mb_stuffing_bit has ended an AEC slice (7.2.4) the bytes
+     * at the reader's position are arithmetic code, and a byte aligned
+     * 00 00 01 in them is a coincidence; aec_end_of_slice() releases gb */
+    if (h->aec_enable && h->aec.gb)
+        return 0;
     align = (-get_bits_count(gb)) & 7;
     /* check for stuffing byte */
     if (!align && (show_bits(gb, 8) == 0x80))
@@ -1025,6 +1349,12 @@ static inline int check_for_slice(AVSContext *h)
         ret = decode_slice_header(h, gb);
         if (ret < 0)
             return ret;
+        if (h->aec_enable) {
+            /* aec_byte_alignment_bit padding, then 8.4.1 */
+            align_get_bits(gb);
+            ff_cavs_aec_init(&h->aec, gb);
+            h->prev_delta_qp = 0;   //reset with PreviousQP, clause 9.3
+        }
         return 1;
     }
     return 0;
@@ -1123,6 +1453,9 @@ static int decode_pic(AVSContext *h)
     h->pic_structure = 1;
     if (!h->progressive)
         h->pic_structure = get_bits1(&h->gb);
+    /* a field coded picture uses inverse block scan method 2 (9.5.3 c)) */
+    h->scantable = h->pic_structure ? h->permutated_scantable
+                                    : h->permutated_scantable_field;
     if (!h->pic_structure && h->stc == PIC_PB_START_CODE)
         skip_bits1(&h->gb);     //advanced_pred_mode_disable
     skip_bits1(&h->gb);        //top_field_first
@@ -1186,20 +1519,34 @@ static int decode_pic(AVSContext *h)
         return AVERROR_PATCHWELCOME;
     }
 
-    if (h->aec_enable) {
-        avpriv_request_sample(h->avctx, "Arithmetic entropy coding (AEC)");
+    /* only the elements an intra macroblock carries are binarised so far */
+    if (h->aec_enable && h->cur.f->pict_type != AV_PICTURE_TYPE_I) {
+        avpriv_request_sample(h->avctx, "AEC coded inter picture");
         return AVERROR_PATCHWELCOME;
     }
 
     ret = 0;
+    h->aec.gb = NULL;   /* started by the first slice header */
     if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
         do {
             ret = check_for_slice(h);
             if (ret < 0)
                 break;
+            if (h->aec_enable && !h->aec.gb) {
+                av_log(h->avctx, AV_LOG_ERROR,
+                       "AEC picture without a slice header\n");
+                ret = AVERROR_INVALIDDATA;
+                break;
+            }
             ret = decode_mb_i(h, 0);
             if (ret < 0)
                 break;
+            /* table 25: an aec_mb_stuffing_bit follows every macroblock and
+             * is 1 on the last one of the slice (7.2.4). It is the real
+             * terminator of an AEC slice; a start code search cannot be
+             * applied to a bitstream pointer the engine has read past. */
+            if (h->aec_enable && ff_cavs_aec_decode_stuffing_bit(&h->aec))
+                aec_end_of_slice(h);
         } while (ff_cavs_next_mb(h));
     } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_P) {
         do {
