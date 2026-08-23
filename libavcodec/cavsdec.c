@@ -1019,6 +1019,7 @@ static int decode_pic(AVSContext *h)
 {
     int ret;
     int skip_count    = -1;
+    int weighting_quant_flag;
     enum cavs_mb mb_type;
 
     if (!h->top_qp) {
@@ -1029,6 +1030,8 @@ static int decode_pic(AVSContext *h)
     av_frame_unref(h->cur.f);
 
     skip_bits(&h->gb, 16);//bbv_delay
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN)
+        skip_bits(&h->gb, 8); //marker_bit, bbv_delay_extension (tables 21, 22)
     if (h->stc == PIC_PB_START_CODE) {
         h->cur.f->pict_type = get_bits(&h->gb, 2) + AV_PICTURE_TYPE_I;
         if (h->cur.f->pict_type > AV_PICTURE_TYPE_B) {
@@ -1043,9 +1046,12 @@ static int decode_pic(AVSContext *h)
         h->cur.f->pict_type = AV_PICTURE_TYPE_I;
         if (get_bits1(&h->gb))
             skip_bits(&h->gb, 24);//time_code
+        /* unconditional marker bit after time_code in this profile */
+        if (h->profile == AV_PROFILE_CAVS_GUANGDIAN)
+            h->stream_revision = 1;
         /* old sample clips were all progressive and no low_delay,
            bump stream revision if detected otherwise */
-        if (h->low_delay || !(show_bits(&h->gb, 9) & 1))
+        else if (h->low_delay || !(show_bits(&h->gb, 9) & 1))
             h->stream_revision = 1;
         /* similarly test top_field_first and repeat_first_field */
         else if (show_bits(&h->gb, 11) & 3)
@@ -1127,6 +1133,41 @@ static int decode_pic(AVSContext *h)
         }
     } else {
         h->alpha_offset = h->beta_offset  = 0;
+    }
+
+    /* AWQ parameters and aec_enable end the header (tables 21, 22) */
+    h->aec_enable = 0;
+    weighting_quant_flag = 0;
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN) {
+        weighting_quant_flag = get_bits1(&h->gb);
+        if (weighting_quant_flag) {
+            int i;
+            int weighting_quant_param_index;
+
+            skip_bits1(&h->gb);         //reserved bit
+            if (!get_bits1(&h->gb)) {   //chroma_quant_param_disable
+                get_se_golomb(&h->gb);  //chroma_quant_param_delta_cb
+                get_se_golomb(&h->gb);  //chroma_quant_param_delta_cr
+            }
+            weighting_quant_param_index = get_bits(&h->gb, 2);
+            skip_bits(&h->gb, 2);       //weighting_quant_model
+            /* weighting_quant_param_delta1[] for index 1, delta2[] for 2 */
+            if (weighting_quant_param_index == 1 ||
+                weighting_quant_param_index == 2)
+                for (i = 0; i < 6; i++)
+                    get_se_golomb(&h->gb);
+        }
+        h->aec_enable = get_bits1(&h->gb);
+    }
+
+    if (weighting_quant_flag) {
+        avpriv_request_sample(h->avctx, "Adaptive weighted quantisation");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    if (h->aec_enable) {
+        avpriv_request_sample(h->avctx, "Arithmetic entropy coding (AEC)");
+        return AVERROR_PATCHWELCOME;
     }
 
     ret = 0;
