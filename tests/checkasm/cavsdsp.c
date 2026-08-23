@@ -20,10 +20,12 @@
 #include <stddef.h>
 
 #include "checkasm.h"
+#include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/macros.h"
 #include "libavutil/mem_internal.h"
 #include "libavcodec/cavsdsp.h"
+#include "libavcodec/idctdsp.h"
 
 
 enum {
@@ -113,7 +115,65 @@ static void check_cavs_qpeldsp(void)
     }
 }
 
+static void check_cavs_idct8_add(void)
+{
+    DECLARE_ALIGNED(16, int16_t, block0)[64];
+    DECLARE_ALIGNED(16, int16_t, block1)[64];
+    DECLARE_ALIGNED(16, uint8_t, dstbuf0)[8 * 16];
+    DECLARE_ALIGNED(16, uint8_t, dstbuf1)[8 * 16];
+    CAVSDSPContext cavsdsp;
+    declare_func(void, uint8_t *dst, int16_t *block, ptrdiff_t stride);
+
+    ff_cavsdsp_init(&cavsdsp);
+
+    if (check_func(cavsdsp.cavs_idct8_add, "cavs_idct8_add")) {
+        for (int iter = 0; iter < 32; ++iter) {
+            int16_t coef[64] = { 0 };
+            /*
+             * The SIMD implementations work in 16 bit lanes while the C
+             * code computes in int; they agree as long as no intermediate
+             * overflows int16_t. The largest per-coefficient weight of the
+             * 1D transform is 16, so with sum(|coef|) = S every first pass
+             * intermediate is below 16 * S + 132 and, after the >> 3,
+             * every second pass intermediate below 32 * S + 2240. Keeping
+             * S <= 950 bounds them all by 32767, which mirrors the
+             * conformance limits real streams decode under.
+             */
+            int budget = 950;
+
+            while (budget > 0) {
+                int idx = rnd() % 64;
+                int v   = (int)(rnd() % (2 * budget + 1)) - budget;
+
+                coef[idx] += v;
+                budget    -= FFMAX(FFABS(v), 1);
+            }
+
+            /* each implementation reads the block in its scan permutation */
+            for (int i = 0; i < 8; ++i)
+                for (int j = 0; j < 8; ++j) {
+                    block0[8 * i + j] = coef[8 * i + j];
+                    if (cavsdsp.idct_perm == FF_IDCT_PERM_TRANSPOSE)
+                        block1[8 * j + i] = coef[8 * i + j];
+                    else
+                        block1[8 * i + j] = coef[8 * i + j];
+                }
+
+            randomize_buffers(dstbuf0, dstbuf1);
+            call_ref(dstbuf0, block0, 16);
+            call_new(dstbuf1, block1, 16);
+            /* the block is caller cleared scratch, only the dst counts */
+            if (memcmp(dstbuf0, dstbuf1, sizeof(dstbuf0)))
+                fail();
+        }
+        bench_new(dstbuf1, block1, 16);
+    }
+}
+
 void checkasm_check_cavsdsp(void)
 {
     check_cavs_qpeldsp();
+    report("qpeldsp");
+    check_cavs_idct8_add();
+    report("idct8");
 }
