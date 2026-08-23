@@ -170,10 +170,69 @@ static void check_cavs_idct8_add(void)
     }
 }
 
+static void check_cavs_loop_filter(void)
+{
+    /* 24 rows of 32; the edge sample sits at (8, 8) so that both the
+     * vertical (16 rows, cols -4..3) and the horizontal (rows -3..2,
+     * 16 cols) geometry stay inside the buffer */
+    DECLARE_ALIGNED(16, uint8_t, buf0)[24 * 32];
+    DECLARE_ALIGNED(16, uint8_t, buf1)[24 * 32];
+    CAVSDSPContext cavsdsp;
+    static const struct {
+        const char *name;
+        size_t offset;
+    } tests[] = {
+        TEST(cavs_filter_lv),
+        TEST(cavs_filter_lh),
+        TEST(cavs_filter_cv),
+        TEST(cavs_filter_ch),
+    };
+    /* every (bs1, bs2) shape ff_cavs_filter() produces */
+    static const int8_t bs_pairs[][2] = {
+        { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 }, { 2, 2 },
+    };
+    declare_func(void, uint8_t *d, ptrdiff_t stride, int alpha, int beta,
+                 int tc, int bs1, int bs2);
+
+    ff_cavsdsp_init(&cavsdsp);
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(tests); ++i) {
+        void (*func)(uint8_t *, ptrdiff_t, int, int, int, int, int) =
+            *(void (*const *)(uint8_t *, ptrdiff_t, int, int, int, int, int))
+                ((const char *)&cavsdsp + tests[i].offset);
+
+        if (check_func(func, "%s", tests[i].name)) {
+            for (size_t bs = 0; bs < FF_ARRAY_ELEMS(bs_pairs); ++bs) {
+                for (int iter = 0; iter < 8; ++iter) {
+                    /* the table ranges: alpha 0..64, beta 0..27, tc 0..9 */
+                    int alpha = rnd() % 65;
+                    int beta  = rnd() % 28;
+                    int tc    = rnd() % 10;
+
+                    randomize_buffers(buf0, buf1);
+                    /* low deltas often, so the filter conditions do fire */
+                    if (iter & 1)
+                        for (size_t k = 0; k < sizeof(buf0); ++k)
+                            buf1[k] = buf0[k] = 128 + (buf0[k] & 15);
+                    call_ref(buf0 + 8 * 32 + 8, 32, alpha, beta, tc,
+                             bs_pairs[bs][0], bs_pairs[bs][1]);
+                    call_new(buf1 + 8 * 32 + 8, 32, alpha, beta, tc,
+                             bs_pairs[bs][0], bs_pairs[bs][1]);
+                    if (memcmp(buf0, buf1, sizeof(buf0)))
+                        fail();
+                }
+            }
+            bench_new(buf1 + 8 * 32 + 8, 32, 40, 20, 4, 2, 2);
+        }
+    }
+}
+
 void checkasm_check_cavsdsp(void)
 {
     check_cavs_qpeldsp();
     report("qpeldsp");
     check_cavs_idct8_add();
     report("idct8");
+    check_cavs_loop_filter();
+    report("loop_filter");
 }
