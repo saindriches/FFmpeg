@@ -622,6 +622,62 @@ static int bt1869_tlv_read_close(AVFormatContext *s)
     return 0;
 }
 
+/* DTS of the first access unit starting at or after *pos, for
+ * ff_seek_frame_binary(). pos_limit is an absolute position. */
+static int64_t bt1869_tlv_read_timestamp(AVFormatContext *s, int stream_index,
+                                         int64_t *pos, int64_t pos_limit)
+{
+    TLVContext *tlv = s->priv_data;
+    AVPacket   *pkt = av_packet_alloc();
+    int64_t     ts  = AV_NOPTS_VALUE;
+
+    if (!pkt)
+        return AV_NOPTS_VALUE;
+    if (avio_seek(s->pb, *pos, SEEK_SET) < 0) {
+        av_packet_free(&pkt);
+        return AV_NOPTS_VALUE;
+    }
+    tlv->last_pos    = -1;
+    tlv->resync_size = MAX_RESYNC;
+    reset_flows(s);
+
+    while (avio_tell(s->pb) < pos_limit) {
+        int ret = bt1869_tlv_read_packet(s, pkt);
+        if (ret < 0) {
+            if (ret == AVERROR_INVALIDDATA)
+                continue;
+            break;
+        }
+        if (pkt->dts != AV_NOPTS_VALUE &&
+            (stream_index < 0 || pkt->stream_index == stream_index)) {
+            *pos = pkt->pos;
+            ts   = pkt->dts;
+            av_packet_unref(pkt);
+            break;
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    tlv->resync_size = 4096;
+    return ts;
+}
+
+static int bt1869_tlv_read_seek(AVFormatContext *s, int stream_index,
+                                int64_t target_ts, int flags)
+{
+    TLVContext *tlv = s->priv_data;
+    int         ret = ff_seek_frame_binary(s, stream_index, target_ts, flags);
+
+    if (ret < 0)
+        return ret;
+    /* the search lands blindly, possibly inside a large TLV packet */
+    tlv->last_pos     = -1;
+    tlv->resync_size  = MAX_RESYNC;
+    tlv->resync_fails = 0;
+    reset_flows(s);
+    return 0;
+}
+
 const FFInputFormat ff_bt1869_tlv_demuxer = {
     .p.name         = "bt1869_tlv",
     .p.long_name    = NULL_IF_CONFIG_SMALL("ITU-R BT.1869 TLV multiplexing"),
@@ -633,4 +689,6 @@ const FFInputFormat ff_bt1869_tlv_demuxer = {
     .read_header    = bt1869_tlv_read_header,
     .read_packet    = bt1869_tlv_read_packet,
     .read_close     = bt1869_tlv_read_close,
+    .read_timestamp = bt1869_tlv_read_timestamp,
+    .read_seek      = bt1869_tlv_read_seek,
 };
