@@ -93,7 +93,7 @@ typedef struct MMTPStream {
     int      au_index;         ///< decoding order index of the AU in its MPU
     int      au_index_lost;    ///< packets were lost in this MPU, au_index may be off
     int      au_untimed;       ///< the AU being assembled started after a loss
-    int      was_timed;        ///< a timed AU was queued since the start or the last reset
+    int      was_timed;        ///< a timed AU was queued; a reset for a seek keeps it
     PacketList held;           ///< AUs of the current MPU waiting for its timestamp,
                                ///< each with its AU index in pts
     int      nb_held;          ///< at most MMTP_MAX_AU

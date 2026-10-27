@@ -77,8 +77,12 @@ int ff_mmtp_flush(MMTPContext *ctx);
 
 /**
  * Forget partial units and MPU state, e.g. after a seek.
+ * @param seek nonzero when the input was moved by a seek or a timestamp
+ *             search, rather than back to its start: a stream that was timed
+ *             stays so, and its AUs that cannot be timed are dropped rather
+ *             than given another stream's timestamps by libavformat
  */
-void ff_mmtp_reset_state(MMTPContext *ctx);
+void ff_mmtp_reset_state(MMTPContext *ctx, int seek);
 
 /**
  * Free a parser and set *ctx to NULL.

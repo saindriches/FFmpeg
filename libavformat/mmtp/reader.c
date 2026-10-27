@@ -848,7 +848,8 @@ int ff_mmtp_queue_packet(MMTPContext *ctx, MMTPStream *ms,
  * untimed AU joins held ones to keep its place, and at most MMTP_MAX_AU
  * are held. Once the stream has been timed, an AU that cannot be is
  * dropped: libavformat would extrapolate its timestamps from the last
- * packet, which may be minutes older when the stream paused. */
+ * packet, which may be minutes older when the stream paused, or take them
+ * from another stream after a seek. */
 static int queue_au(MMTPContext *ctx, MMTPStream *ms, AVPacket *pkt, int au)
 {
     int64_t pts = AV_NOPTS_VALUE, dts = AV_NOPTS_VALUE;
@@ -1291,7 +1292,7 @@ int ff_mmtp_parse_packet(MMTPContext *ctx, const uint8_t *buf, int size,
     return 0;
 }
 
-void ff_mmtp_reset_state(MMTPContext *ctx)
+void ff_mmtp_reset_state(MMTPContext *ctx, int seek)
 {
     for (FragmentAssembler *frag = ctx->assembler; frag; frag = frag->next) {
         frag->state = FRAG_INIT;
@@ -1304,7 +1305,10 @@ void ff_mmtp_reset_state(MMTPContext *ctx)
         ms->mpu_seq           = 0;
         ms->au_count          = 0;
         ms->au_index_lost     = 0;
-        ms->was_timed         = 0;
+        /* STD-B60 sends the audio MPU timestamps before the MPU, so the
+         * first audio AUs after a seek cannot be timed */
+        if (!seek)
+            ms->was_timed     = 0;
         ff_packet_list_free(&ms->held);
         ms->nb_held           = 0;
         ms->started_mpu       = 0;
