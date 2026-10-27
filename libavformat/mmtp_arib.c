@@ -20,6 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
+
 #include "libavcodec/bytestream.h"
 #include "libavutil/crc.h"
 #include "libavutil/dict.h"
@@ -34,10 +36,15 @@ enum {
 };
 
 enum {
+    MH_EIT_PF_ACTUAL_TABLE_ID = 0x8B,
+};
+
+enum {
     VIDEO_COMPONENT_DESCRIPTOR        = 0x8010,
     MH_AUDIO_COMPONENT_DESCRIPTOR     = 0x8014,
     MH_DATA_COMPONENT_DESCRIPTOR      = 0x8020,
     MPU_EXTENDED_TIMESTAMP_DESCRIPTOR = 0x8026,
+    MH_SHORT_EVENT_DESCRIPTOR         = 0xF001,
 };
 
 /* time control modes of ARIB STD-B60 Table 9-7 timed by the MPU */
@@ -60,15 +67,35 @@ static int descriptor_body(GetByteContext *gbc, GetByteContext *body)
     return 0;
 }
 
+/* Set an entry, or delete it when value is NULL. With AV_DICT_DONT_STRDUP_VAL
+ * value is taken over in all cases. Returns 1 if the entry changed. */
+static int update_metadata(AVDictionary **meta, const char *key, char *value, int flags)
+{
+    const AVDictionaryEntry *cur = av_dict_get(*meta, key, NULL, 0);
+    int ret;
+
+    if (cur ? value && !strcmp(cur->value, value) : !value) {
+        if (flags & AV_DICT_DONT_STRDUP_VAL)
+            av_free(value);
+        return 0;
+    }
+    ret = av_dict_set(meta, key, value, flags);
+    return ret < 0 ? ret : 1;
+}
+
 static int set_language(AVStream *st, GetByteContext *gbc)
 {
     char language[4];
+    int ret;
 
     if (bytestream2_get_bytes_left(gbc) < 3)
         return AVERROR_INVALIDDATA;
     bytestream2_get_bufferu(gbc, language, 3);
     language[3] = '\0';
-    return av_dict_set(&st->metadata, "language", language, 0);
+    ret = update_metadata(&st->metadata, "language", language, 0);
+    if (ret > 0)
+        st->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+    return FFMIN(ret, 0);
 }
 
 static int parse_video_component_descriptor(MMTPStream *ms, GetByteContext *d)
@@ -84,7 +111,8 @@ static int parse_mh_audio_component_descriptor(MMTPStream *ms, GetByteContext *d
 {
     AVStream *st = ms->st;
     unsigned  stream_content, stream_type, flags;
-    int       ret;
+    char     *title = NULL;
+    int       ret, text_length;
 
     if (bytestream2_get_bytes_left(d) < 10)
         return AVERROR_INVALIDDATA;
@@ -104,7 +132,19 @@ static int parse_mh_audio_component_descriptor(MMTPStream *ms, GetByteContext *d
         ff_mmtp_set_codec(ms, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
     else if (stream_content == 0x4)
         ff_mmtp_set_codec(ms, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_MP4ALS);
-    return 0;
+
+    st->disposition &= ~AV_DISPOSITION_DEFAULT;
+    if (flags & 0x40)                                 // main_component_flag
+        st->disposition |= AV_DISPOSITION_DEFAULT;
+
+    text_length = bytestream2_get_bytes_left(d);
+    if (text_length > 0 && !(title = av_strndup(d->buffer, text_length)))
+        return AVERROR(ENOMEM);
+    /* a program boundary can rename the track */
+    if ((ret = update_metadata(&st->metadata, "title", title,
+                               AV_DICT_DONT_STRDUP_VAL)) > 0)
+        st->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+    return FFMIN(ret, 0);
 }
 
 /* Additional_Arib_Subtitle_Info(), ARIB STD-B60 Table 9-3 */
@@ -246,6 +286,107 @@ int ff_mmtp_arib_parse_asset_descriptor(MMTPContext *ctx, MMTPStream *ms,
     }
 }
 
+/* MH-short event descriptor, ARIB STD-B60 Table 7-45: the language, name
+ * and text of the event, as program metadata. */
+static int parse_mh_short_event_descriptor(MMTPContext *ctx, GetByteContext *gbc)
+{
+    AVDictionary **meta = &ctx->program->metadata;
+    GetByteContext d;
+    char           language[4];
+    char          *name, *text;
+    unsigned       length;
+    int            ret, changed;
+
+    bytestream2_skipu(gbc, 2);
+    length = bytestream2_get_be16u(gbc);
+    if (bytestream2_get_bytes_left(gbc) < length)
+        return AVERROR_INVALIDDATA;
+    bytestream2_init(&d, gbc->buffer, length);
+    bytestream2_skipu(gbc, length);
+
+    if (bytestream2_get_bytes_left(&d) < 4)
+        return AVERROR_INVALIDDATA;
+    bytestream2_get_bufferu(&d, language, 3);
+    language[3] = '\0';
+    length = bytestream2_get_byteu(&d);
+    if (bytestream2_get_bytes_left(&d) < length + 2)
+        return AVERROR_INVALIDDATA;
+    name = av_strndup(d.buffer, length);
+    bytestream2_skipu(&d, length);
+    length = bytestream2_get_be16u(&d);
+    if (!name || bytestream2_get_bytes_left(&d) < length) {
+        av_free(name);
+        return name ? AVERROR_INVALIDDATA : AVERROR(ENOMEM);
+    }
+    text = av_strndup(d.buffer, length);
+    if (!text) {
+        av_free(name);
+        return AVERROR(ENOMEM);
+    }
+
+    /* the present event changes at a program boundary */
+    if ((ret = update_metadata(meta, "language", language, 0)) < 0) {
+        av_free(name);
+        av_free(text);
+        return ret;
+    }
+    changed = ret;
+    if ((ret = update_metadata(meta, "title", name, AV_DICT_DONT_STRDUP_VAL)) < 0) {
+        av_free(text);
+        return ret;
+    }
+    changed |= ret;
+    if ((ret = update_metadata(meta, "description", text, AV_DICT_DONT_STRDUP_VAL)) < 0)
+        return ret;
+    if (changed | ret)
+        ctx->s->event_flags |= AVFMT_EVENT_FLAG_METADATA_UPDATED;
+    return 0;
+}
+
+/* MH-EIT, ARIB STD-B60 Table 7-18: only the present event of section 0 of
+ * the p/f table names the current program. */
+static int parse_mh_eit(MMTPContext *ctx, GetByteContext *s)
+{
+    unsigned flags, section_number;
+
+    if (bytestream2_get_bytes_left(s) < 11)
+        return AVERROR_INVALIDDATA;
+    bytestream2_skipu(s, 2);                          // service_id
+    flags          = bytestream2_get_byteu(s);        // version, current_next_indicator
+    section_number = bytestream2_get_byteu(s);
+    bytestream2_skipu(s, 7);
+    if (section_number != 0 || !(flags & 1))
+        return 0;
+
+    while (bytestream2_get_bytes_left(s) > 0) {
+        GetByteContext d;
+        unsigned       length;
+
+        /* event_id, start_time, duration, running_status .. loop length */
+        if (bytestream2_get_bytes_left(s) < 12)
+            return AVERROR_INVALIDDATA;
+        bytestream2_skipu(s, 10);
+        length = bytestream2_get_be16u(s) & 0xFFF;
+        if (bytestream2_get_bytes_left(s) < length)
+            return AVERROR_INVALIDDATA;
+        bytestream2_init(&d, s->buffer, length);
+        bytestream2_skipu(s, length);
+
+        while (bytestream2_get_bytes_left(&d) > 0) {
+            int ret;
+            if (bytestream2_get_bytes_left(&d) < 4)
+                return AVERROR_INVALIDDATA;
+            if (bytestream2_peek_be16u(&d) == MH_SHORT_EVENT_DESCRIPTOR)
+                ret = parse_mh_short_event_descriptor(ctx, &d);
+            else
+                ret = ff_mmtp_skip_descriptor(ctx, &d);
+            if (ret < 0)
+                return ret;
+        }
+    }
+    return 0;
+}
+
 /* STD-B60 Table 6-8: a list of hdr_ext_end_flag, hdr_ext_type and
  * hdr_ext_length. Type 0x0001 holds the scramble information of STD-B61,
  * whose encryption_flag is 10 (even key) or 11 (odd key) when the payload
@@ -270,8 +411,9 @@ int ff_mmtp_arib_is_scrambled(GetByteContext *gbc)
 /* M2 section message: one MPEG-2 style section with a CRC_32 */
 int ff_mmtp_arib_parse_message(MMTPContext *ctx, GetByteContext *gbc)
 {
+    GetByteContext s;
     const uint8_t *section;
-    unsigned       length, section_length;
+    unsigned       length, section_length, table_id;
 
     if (bytestream2_peek_be16u(gbc) != M2_SECTION_MESSAGE_ID)
         return 0;
@@ -282,6 +424,7 @@ int ff_mmtp_arib_parse_message(MMTPContext *ctx, GetByteContext *gbc)
     if (length < 3 || bytestream2_get_bytes_left(gbc) < length)
         return AVERROR_INVALIDDATA;
     section        = gbc->buffer;
+    table_id       = section[0];
     section_length = AV_RB16(section + 1) & 0xFFF;
     if (section_length < 4 || section_length + 3 > length)
         return AVERROR_INVALIDDATA;
@@ -289,7 +432,11 @@ int ff_mmtp_arib_parse_message(MMTPContext *ctx, GetByteContext *gbc)
                section, section_length + 3))
         return AVERROR_INVALIDDATA;
     ff_mmtp_set_flavor(ctx, MMTP_FLAVOR_ARIB);
-    return 0;
+
+    if (table_id != MH_EIT_PF_ACTUAL_TABLE_ID)
+        return 0;
+    bytestream2_init(&s, section + 3, section_length - 4);
+    return parse_mh_eit(ctx, &s);
 }
 
 /* Subtitle MFU, ARIB STD-B60 Table 9-1 */

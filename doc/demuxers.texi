@@ -74,8 +74,9 @@ example recordings with the @file{.mmts} extension.
 
 TLV packets carry IPv4, IPv6 and header compressed IP packets, and the UDP
 payloads in them are MMTP packets (ISO/IEC 23008-1). Each IP flow becomes a
-program. Streams, timestamps and languages come from the ARIB STD-B60
-signalling: the MMT package table and the MPU timestamp descriptors.
+program. Streams, timestamps, languages and the program title come from the
+ARIB STD-B60 signalling: the MMT package table, the MPU timestamp
+descriptors and the MH-EIT.
 
 HEVC video, AAC audio in LATM and ARIB TTML subtitles are read. MMTP
 version 1 packets (the QoS header) and scrambled payloads are skipped.
