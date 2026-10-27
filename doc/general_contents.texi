@@ -465,6 +465,8 @@ library:
     @tab Audio format used on the Nintendo WiiU (based on BRSTM).
 @item BRSTM                     @tab   @tab X
     @tab Audio format used on the Nintendo Wii.
+@item BT.1869 TLV (MMT/TLV)     @tab   @tab X
+    @tab Used in Japanese 4K and 8K satellite broadcasting.
 @item BW64                      @tab   @tab X
     @tab Broadcast Wave 64bit.
 @item BWF                       @tab X @tab X
