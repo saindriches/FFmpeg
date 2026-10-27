@@ -29,6 +29,9 @@ fate-bcstm: CMD = crc -i $(TARGET_SAMPLES)/bfstm/loz-mm-mikau.bcstm -c:a copy
 FATE_SAMPLES_DEMUX-$(call CRC, BRSTM) += fate-brstm
 fate-brstm: CMD = crc -i $(TARGET_SAMPLES)/brstm/lozswd_partial.brstm -c:a copy
 
+FATE_FFPROBE_DEMUX-$(call DEMDEC, BT1869_TLV, HEVC AAC_LATM, EXTRACT_EXTRADATA_BSF) += fate-bt1869-tlv-demux
+fate-bt1869-tlv-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/mmt/b111-1s.mmts -show_programs
+
 FATE_FFPROBE_DEMUX-$(call DEMDEC, CAVSVIDEO, CAVS, CAVSVIDEO_PARSER EXTRACT_EXTRADATA_BSF) += fate-cavs-demux
 fate-cavs-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/cavs/bunny.mp4
 
