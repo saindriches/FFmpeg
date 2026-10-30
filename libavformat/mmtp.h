@@ -26,7 +26,7 @@
 #include <stdint.h>
 
 #include "avformat.h"
-#include "packet_internal.h"
+#include "libavcodec/packet_internal.h"
 
 /**
  * Parser state of one MMTP flow. It knows nothing of the carriage: the

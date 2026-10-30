@@ -28,7 +28,7 @@
 #include "internal.h"
 #include "mmtp.h"
 #include "mmtp_internal.h"
-#include "packet_internal.h"
+#include "libavcodec/packet_internal.h"
 
 enum {
     PA_MESSAGE_ID        = 0x0000,
@@ -153,7 +153,9 @@ MMTPStream *ff_mmtp_get_stream(MMTPContext *ctx, uint16_t packet_id)
         av_free(ms);
         return NULL;
     }
-    if (av_program_add_stream_index2(ctx->s, ctx->program->id, st->index) < 0) {
+    av_program_add_stream_index(ctx->s, ctx->program->id, st->index);
+    if (!ctx->program->nb_stream_indexes ||
+        ctx->program->stream_index[ctx->program->nb_stream_indexes - 1] != st->index) {
         ff_remove_stream(ctx->s, st);
         av_free(ms);
         return NULL;
@@ -304,7 +306,7 @@ static int release_held(MMTPContext *ctx, MMTPStream *ms)
     AVPacket *pkt = ctx->pkt;
     int       ret;
 
-    while (ff_packet_list_get(&ms->held, pkt) >= 0) {
+    while (avpriv_packet_list_get(&ms->held, pkt) >= 0) {
         int au = pkt->pts;
 
         ms->nb_held--;
@@ -316,7 +318,7 @@ static int release_held(MMTPContext *ctx, MMTPStream *ms)
         if (au >= 0)
             au_timestamps(ms, au, &pkt->pts, &pkt->dts);
         ms->was_timed |= pkt->dts != AV_NOPTS_VALUE || pkt->pts != AV_NOPTS_VALUE;
-        if ((ret = ff_packet_list_put(ctx->queue, pkt, NULL, 0)) < 0) {
+        if ((ret = avpriv_packet_list_put(ctx->queue, pkt, NULL, 0)) < 0) {
             av_packet_unref(pkt);
             return ret;
         }
@@ -793,7 +795,7 @@ static int put_packet(MMTPStream *ms, PacketList *list, AVPacket *pkt,
     pkt->pts          = pts;
     pkt->dts          = dts;
     pkt->pos          = ms->pos;
-    ret = ff_packet_list_put(list, pkt, NULL, 0);
+    ret = avpriv_packet_list_put(list, pkt, NULL, 0);
     if (ret < 0)
         av_packet_unref(pkt);
     return ret;
@@ -1267,7 +1269,7 @@ void ff_mmtp_reset_state(MMTPContext *ctx)
         ms->au_count          = 0;
         ms->au_index_lost     = 0;
         ms->was_timed         = 0;
-        ff_packet_list_free(&ms->held);
+        avpriv_packet_list_free(&ms->held);
         ms->nb_held           = 0;
         ms->started_mpu       = 0;
         ms->in_sample         = 0;
@@ -1296,7 +1298,7 @@ void ff_mmtp_parse_close(MMTPContext **pctx)
             av_free(ms->ext_timestamps[i].au);
         av_free(ms->ext_timestamps);
         av_free(ms->au);
-        ff_packet_list_free(&ms->held);
+        avpriv_packet_list_free(&ms->held);
         av_free(ms);
     }
     av_packet_free(&ctx->pkt);

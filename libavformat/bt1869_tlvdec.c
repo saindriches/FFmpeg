@@ -34,7 +34,7 @@
 #include "demux.h"
 #include "internal.h"
 #include "mmtp.h"
-#include "packet_internal.h"
+#include "libavcodec/packet_internal.h"
 
 #define TLV_SYNC 0x7F
 
@@ -296,8 +296,8 @@ static void reset_flows(AVFormatContext *s)
 
     for (TLVFlow *flow = tlv->flows; flow; flow = flow->next)
         ff_mmtp_reset_state(flow->mmtp);
-    ff_packet_list_free(&tlv->queue);
-    ff_packet_list_free(&tlv->held);
+    avpriv_packet_list_free(&tlv->queue);
+    avpriv_packet_list_free(&tlv->held);
     tlv->nb_held = 0;
     tlv->flushed = 0;
 }
@@ -437,7 +437,7 @@ static int read_queued(AVFormatContext *s, AVPacket *pkt)
             return ret;
     }
     tlv->queue_end = avio_tell(s->pb);
-    return ff_packet_list_get(&tlv->queue, pkt);
+    return avpriv_packet_list_get(&tlv->queue, pkt);
 }
 
 static void set_origin(AVFormatContext *s, const AVPacket *pkt)
@@ -460,7 +460,7 @@ static int read_timed(AVFormatContext *s, AVPacket *pkt)
     for (;;) {
         if (tlv->held.head && tlv->first_pts != AV_NOPTS_VALUE) {
             tlv->nb_held--;
-            return ff_packet_list_get(&tlv->held, pkt);
+            return avpriv_packet_list_get(&tlv->held, pkt);
         }
         ret = read_queued(s, pkt);
         if (ret == AVERROR_EOF && tlv->held.head) {
@@ -474,7 +474,7 @@ static int read_timed(AVFormatContext *s, AVPacket *pkt)
             set_origin(s, pkt);
             return 0;
         }
-        if ((ret = ff_packet_list_put(&tlv->held, pkt, NULL, 0)) < 0) {
+        if ((ret = avpriv_packet_list_put(&tlv->held, pkt, NULL, 0)) < 0) {
             av_packet_unref(pkt);
             return ret;
         }
@@ -616,8 +616,8 @@ static int bt1869_tlv_read_close(AVFormatContext *s)
         av_free(flow);
     }
     tlv->flows = NULL;
-    ff_packet_list_free(&tlv->queue);
-    ff_packet_list_free(&tlv->held);
+    avpriv_packet_list_free(&tlv->queue);
+    avpriv_packet_list_free(&tlv->held);
     av_freep(&tlv->buf);
     return 0;
 }

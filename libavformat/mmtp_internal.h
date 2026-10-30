@@ -29,7 +29,7 @@
 #include "libavcodec/bytestream.h"
 #include "avformat.h"
 #include "mmtp.h"
-#include "packet_internal.h"
+#include "libavcodec/packet_internal.h"
 
 /**
  * The signalling profile of an MMTP flow. The ISO/IEC 23008-1 core is the
