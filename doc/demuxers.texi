@@ -84,7 +84,10 @@ TLV packets carry IPv4, IPv6 and header compressed IP packets. In these
 broadcasts the UDP payloads are MMTP packets (ISO/IEC 23008-1), and each UDP
 flow that carries MMTP becomes a program. Streams, timestamps and languages
 come from the ARIB STD-B60 signalling: the MMT package table and the MPU
-timestamp descriptors.
+timestamp descriptors. The program title, description and language come from
+the MH-EIT, and the audio track titles and the default track from the MH
+audio component descriptors. Changes during the recording are signalled as
+metadata updates.
 
 HEVC video, AAC audio in LATM and ARIB TTML subtitles are read; the AAC
 frames get LOAS headers. IPv4 packets with compressed headers, MMTP version 1
