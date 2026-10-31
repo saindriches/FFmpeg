@@ -43,6 +43,8 @@ enum MMTPFlavor {
 
 /** AUs one MPU extended timestamp descriptor can time (num_of_au is 8 bits) */
 #define MMTP_MAX_AU                    0x100
+/** AU index for a packet timed with the MPU presentation time as such */
+#define MMTP_AU_MPU_TIME               INT_MAX
 
 typedef struct MMTPTimestamp {
     uint32_t seq_num;
@@ -97,6 +99,8 @@ typedef struct MMTPStream {
     int      nb_held;          ///< at most MMTP_MAX_AU
     int64_t  au_pos;
     int64_t  pos;
+
+    int      ttml_tmd;          ///< ARIB time control mode, -1 if unknown
 
     struct MMTPStream *next;
 } MMTPStream;
@@ -170,6 +174,22 @@ void *ff_mmtp_timestamp_slot(void *array, int *nb, size_t elem_size,
  */
 int64_t ff_mmtp_mpu_presentation_time(const MMTPStream *ms, uint32_t mpu_seq);
 
+/**
+ * Queue a packet holding size bytes of gbc, timestamped with pts/dts.
+ */
+int ff_mmtp_queue_packet(MMTPContext *ctx, MMTPStream *ms,
+                         GetByteContext *gbc, int size,
+                         int64_t pts, int64_t dts);
+
+/**
+ * Queue a packet holding size bytes of gbc as access unit au of the current
+ * MPU, held until the MPU timestamps are known.
+ *
+ * @param au decoding order index, -1 for no timestamps, or MMTP_AU_MPU_TIME
+ */
+int ff_mmtp_queue_au(MMTPContext *ctx, MMTPStream *ms,
+                     GetByteContext *gbc, int size, int au);
+
 /* ARIB STD-B60, implemented in arib.c */
 
 /**
@@ -189,5 +209,11 @@ int ff_mmtp_arib_parse_message(MMTPContext *ctx, GetByteContext *gbc);
  * payload as scrambled.
  */
 int ff_mmtp_arib_is_scrambled(GetByteContext *gbc);
+
+/**
+ * Parse the ARIB subtitle MFU header and queue the TTML document it carries.
+ */
+int ff_mmtp_arib_parse_subtitle_mfu(MMTPContext *ctx, MMTPStream *ms,
+                                    GetByteContext *gbc);
 
 #endif /* AVFORMAT_MMTP_READER_H */

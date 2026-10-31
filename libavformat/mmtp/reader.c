@@ -182,6 +182,7 @@ MMTPStream *ff_mmtp_get_stream(MMTPContext *ctx, uint16_t packet_id)
     ms->st        = st;
     ms->packet_id = packet_id;
     ms->pos       = -1;
+    ms->ttml_tmd  = -1;
     ms->next      = ctx->streams;
     ctx->streams  = ms;
     return ms;
@@ -296,6 +297,10 @@ static void au_timestamps(MMTPStream *ms, int au, int64_t *pts, int64_t *dts)
     time = ff_mmtp_mpu_presentation_time(ms, ms->mpu_seq);
     if (time == AV_NOPTS_VALUE)
         return;
+    if (au == MMTP_AU_MPU_TIME) {
+        *pts = *dts = time;
+        return;
+    }
     if (!(ext = find_ext_timestamp(ms))) {
         if (!au && ms->st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
             *pts = time;
@@ -445,7 +450,8 @@ void ff_mmtp_set_codec(MMTPStream *ms, enum AVMediaType type, enum AVCodecID id)
     ffstream(ms->st)->need_parsing = id == AV_CODEC_ID_HEVC ||
                                      id == AV_CODEC_ID_AAC_LATM ?
                                      AVSTREAM_PARSE_HEADERS : AVSTREAM_PARSE_NONE;
-    ms->supported = id == AV_CODEC_ID_HEVC || id == AV_CODEC_ID_AAC_LATM;
+    ms->supported = id == AV_CODEC_ID_HEVC || id == AV_CODEC_ID_AAC_LATM ||
+                    id == AV_CODEC_ID_TTML;
 }
 
 /* MMT package table, ARIB STD-B60 Table 7-6: a stream for each supported
@@ -525,6 +531,11 @@ static int parse_mmt_package_table(MMTPContext *ctx, GetByteContext *gbc)
              * descriptor can still name another coding */
             if (ms->st->codecpar->codec_id == AV_CODEC_ID_NONE)
                 ff_mmtp_set_codec(ms, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC_LATM);
+            break;
+        case MKTAG('s', 't', 'p', 'p'):
+            if (!(ms = ff_mmtp_get_stream(ctx, packet_id)))
+                break;
+            ms->st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
             break;
         default:
             continue;
@@ -820,6 +831,17 @@ static int put_packet(MMTPStream *ms, PacketList *list, AVPacket *pkt,
     return ret;
 }
 
+int ff_mmtp_queue_packet(MMTPContext *ctx, MMTPStream *ms,
+                         GetByteContext *gbc, int size,
+                         int64_t pts, int64_t dts)
+{
+    int ret = new_packet(ctx->pkt, NULL, 0, gbc, size);
+
+    if (ret < 0)
+        return ret;
+    return put_packet(ms, ctx->queue, ctx->pkt, pts, dts);
+}
+
 /* Queue pkt as AU au of the current MPU, -1 if its index is unreliable.
  * ARIB STD-B60 sends the MPU timestamps before the MPU, so after a seek the
  * first AUs arrive before them; those are held until an MPT brings them. An
@@ -851,6 +873,16 @@ static int queue_au(MMTPContext *ctx, MMTPStream *ms, AVPacket *pkt, int au)
     }
     ms->was_timed |= pts != AV_NOPTS_VALUE || dts != AV_NOPTS_VALUE;
     return put_packet(ms, ctx->queue, pkt, pts, dts);
+}
+
+int ff_mmtp_queue_au(MMTPContext *ctx, MMTPStream *ms,
+                     GetByteContext *gbc, int size, int au)
+{
+    int ret = new_packet(ctx->pkt, NULL, 0, gbc, size);
+
+    if (ret < 0)
+        return ret;
+    return queue_au(ctx, ms, ctx->pkt, au);
 }
 
 static int append_au(MMTPStream *ms, const uint8_t *data, int size)
@@ -1034,7 +1066,8 @@ static int hevc_data_unit(MMTPContext *ctx, MMTPStream *ms, FragmentAssembler *f
     return AVERROR_INVALIDDATA;
 }
 
-/* One MFU: each AAC frame gets a LOAS header. */
+/* One MFU: each AAC frame gets a LOAS header, and TTML goes to the ARIB
+ * part. */
 static int consume_mfu(MMTPContext *ctx, GetByteContext *gbc, int64_t pos)
 {
     MMTPStream *ms = find_stream(ctx, ctx->current_pid);
@@ -1059,6 +1092,8 @@ static int consume_mfu(MMTPContext *ctx, GetByteContext *gbc, int64_t pos)
             return ret;
         return queue_au(ctx, ms, ctx->pkt, ms->au_index_lost ? -1 : au);
     }
+    case AV_CODEC_ID_TTML:
+        return ff_mmtp_arib_parse_subtitle_mfu(ctx, ms, gbc);
     }
     return 0;
 }

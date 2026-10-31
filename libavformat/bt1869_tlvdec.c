@@ -60,6 +60,7 @@ enum {
 #define UDP_PROTOCOL 17
 #define NTP_PORT     123
 #define MAX_RESYNC   (65536 + 4096)
+#define MAX_HELD     32
 #define MAX_FLOWS    256
 
 typedef struct TLVFlow {
@@ -76,6 +77,8 @@ typedef struct TLVContext {
     int        next_flow_id;
     PacketList queue;
     int64_t    queue_end;        ///< input position after the queued packets
+    PacketList held;             ///< timed subtitles read before first_pts was known
+    int        nb_held;
 
     int64_t  last_pos;
     int64_t  resync_from;        ///< next byte to try after damage met in sequence, or -1
@@ -298,6 +301,8 @@ static void reset_flows(AVFormatContext *s)
     for (TLVFlow *flow = tlv->flows; flow; flow = flow->next)
         ff_mmtp_reset_state(flow->mmtp);
     ff_packet_list_free(&tlv->queue);
+    ff_packet_list_free(&tlv->held);
+    tlv->nb_held = 0;
     tlv->flushed = 0;
 }
 
@@ -461,15 +466,38 @@ static void set_origin(AVFormatContext *s, const AVPacket *pkt)
 }
 
 /* MMT presentation times are absolute (NTP based), so the streams are made
- * to start near zero, also on inputs that cannot be scanned at open. */
+ * to start near zero, also on inputs that cannot be scanned at open. Subtitle
+ * documents can be timed long before the media, so the origin comes from
+ * audio or video; timed subtitles read before it is known are held back. */
 static int read_timed(AVFormatContext *s, AVPacket *pkt)
 {
     TLVContext *tlv = s->priv_data;
-    int         ret = read_queued(s, pkt);
+    int         ret;
 
-    if (ret >= 0 && tlv->first_pts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
-        set_origin(s, pkt);
-    return ret;
+    for (;;) {
+        if (tlv->held.head && tlv->first_pts != AV_NOPTS_VALUE) {
+            tlv->nb_held--;
+            return ff_packet_list_get(&tlv->held, pkt);
+        }
+        ret = read_queued(s, pkt);
+        if (ret == AVERROR_EOF && tlv->held.head) {
+            set_origin(s, &tlv->held.head->pkt);      // only subtitles are timed
+            continue;
+        }
+        if (ret < 0 || tlv->first_pts != AV_NOPTS_VALUE || pkt->pts == AV_NOPTS_VALUE)
+            return ret;
+        if (s->streams[pkt->stream_index]->codecpar->codec_type !=
+            AVMEDIA_TYPE_SUBTITLE) {
+            set_origin(s, pkt);
+            return 0;
+        }
+        if ((ret = ff_packet_list_put(&tlv->held, pkt, NULL, 0)) < 0) {
+            av_packet_unref(pkt);
+            return ret;
+        }
+        if (++tlv->nb_held >= MAX_HELD)
+            set_origin(s, &tlv->held.head->pkt);
+    }
 }
 
 static int bt1869_tlv_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -608,6 +636,7 @@ static int bt1869_tlv_read_close(AVFormatContext *s)
     }
     tlv->flows = NULL;
     ff_packet_list_free(&tlv->queue);
+    ff_packet_list_free(&tlv->held);
     av_freep(&tlv->buf);
     return 0;
 }

@@ -36,7 +36,14 @@ enum {
 enum {
     VIDEO_COMPONENT_DESCRIPTOR        = 0x8010,
     MH_AUDIO_COMPONENT_DESCRIPTOR     = 0x8014,
+    MH_DATA_COMPONENT_DESCRIPTOR      = 0x8020,
     MPU_EXTENDED_TIMESTAMP_DESCRIPTOR = 0x8026,
+};
+
+/* time control modes of ARIB STD-B60 Table 9-7 timed by the MPU */
+enum {
+    TMD_MPU_TIMESTAMP_ORIGIN = 0x3,
+    TMD_MPU_TIMESTAMP        = 0x8,
 };
 
 /* Split off the body of an 8-bit length descriptor. */
@@ -97,6 +104,41 @@ static int parse_mh_audio_component_descriptor(MMTPStream *ms, GetByteContext *d
         ff_mmtp_set_codec(ms, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
     else if (stream_content == 0x4)
         ff_mmtp_set_codec(ms, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_MP4ALS);
+    return 0;
+}
+
+/* Additional_Arib_Subtitle_Info(), ARIB STD-B60 Table 9-3 */
+static int parse_additional_arib_subtitle_info(MMTPStream *ms, GetByteContext *d)
+{
+    unsigned flags, format;
+    int      ret;
+
+    if (bytestream2_get_bytes_left(d) < 8)
+        return AVERROR_INVALIDDATA;
+    bytestream2_skipu(d, 1);                          // subtitle_tag
+    flags = bytestream2_get_byteu(d);                 // version, start_mpu_sequence_number_flag
+    if ((ret = set_language(ms->st, d)) < 0)
+        return ret;
+    format       = bytestream2_get_byteu(d) >> 2 & 0xF;
+    ms->ttml_tmd = bytestream2_get_byteu(d) >> 4;     // TMD, DMF
+    bytestream2_skipu(d, 1);                          // resolution, compression_type
+    if (flags & 0x08) {
+        if (bytestream2_get_bytes_left(d) < 4)
+            return AVERROR_INVALIDDATA;
+        bytestream2_skipu(d, 4);                      // start_mpu_sequence_number
+    }
+
+    if (format == 0)
+        ff_mmtp_set_codec(ms, AVMEDIA_TYPE_SUBTITLE, AV_CODEC_ID_TTML);
+    return 0;
+}
+
+static int parse_mh_data_component_descriptor(MMTPStream *ms, GetByteContext *d)
+{
+    if (bytestream2_get_bytes_left(d) < 2)
+        return AVERROR_INVALIDDATA;
+    if (bytestream2_get_be16u(d) == 0x0020)           // data_component_id: subtitles
+        return parse_additional_arib_subtitle_info(ms, d);
     return 0;
 }
 
@@ -183,6 +225,7 @@ int ff_mmtp_arib_parse_asset_descriptor(MMTPContext *ctx, MMTPStream *ms,
     switch (tag) {
     case VIDEO_COMPONENT_DESCRIPTOR:
     case MH_AUDIO_COMPONENT_DESCRIPTOR:
+    case MH_DATA_COMPONENT_DESCRIPTOR:
     case MPU_EXTENDED_TIMESTAMP_DESCRIPTOR:
         break;
     default:
@@ -196,6 +239,8 @@ int ff_mmtp_arib_parse_asset_descriptor(MMTPContext *ctx, MMTPStream *ms,
         return parse_video_component_descriptor(ms, &d);
     case MH_AUDIO_COMPONENT_DESCRIPTOR:
         return parse_mh_audio_component_descriptor(ms, &d);
+    case MH_DATA_COMPONENT_DESCRIPTOR:
+        return parse_mh_data_component_descriptor(ms, &d);
     default:
         return parse_mpu_extended_timestamp_descriptor(ms, &d);
     }
@@ -245,4 +290,35 @@ int ff_mmtp_arib_parse_message(MMTPContext *ctx, GetByteContext *gbc)
         return AVERROR_INVALIDDATA;
     ff_mmtp_set_flavor(ctx, MMTP_FLAVOR_ARIB);
     return 0;
+}
+
+/* Subtitle MFU, ARIB STD-B60 Table 9-1 */
+int ff_mmtp_arib_parse_subtitle_mfu(MMTPContext *ctx, MMTPStream *ms,
+                                    GetByteContext *gbc)
+{
+    unsigned subsample_number, last_subsample_number, flags;
+    uint32_t data_size;
+    int      length_ext;
+
+    if (bytestream2_get_bytes_left(gbc) < 7)
+        return AVERROR_INVALIDDATA;
+    bytestream2_skipu(gbc, 2);                        // subtitle_tag, subtitle_sequence_number
+    subsample_number      = bytestream2_get_byteu(gbc);
+    last_subsample_number = bytestream2_get_byteu(gbc);
+    flags                 = bytestream2_get_byteu(gbc);
+    length_ext            = flags >> 3 & 1;
+    if (flags >> 4)                                   // data_type: only TTML documents
+        return 0;
+    if (bytestream2_get_bytes_left(gbc) < (length_ext ? 4 : 2))
+        return AVERROR_INVALIDDATA;
+    data_size = length_ext ? bytestream2_get_be32u(gbc) : bytestream2_get_be16u(gbc);
+    if (subsample_number == 0 && last_subsample_number > 0 && flags & 0x04)
+        bytestream2_skip(gbc, last_subsample_number * (length_ext ? 5 : 3));
+    if (bytestream2_get_bytes_left(gbc) < data_size)
+        return AVERROR_INVALIDDATA;
+
+    if (ms->ttml_tmd == TMD_MPU_TIMESTAMP_ORIGIN || ms->ttml_tmd == TMD_MPU_TIMESTAMP)
+        return ff_mmtp_queue_au(ctx, ms, gbc, data_size, MMTP_AU_MPU_TIME);
+    return ff_mmtp_queue_packet(ctx, ms, gbc, data_size,
+                                AV_NOPTS_VALUE, AV_NOPTS_VALUE);
 }
