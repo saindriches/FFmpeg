@@ -24,12 +24,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "libavutil/attributes.h"
 #include "libavutil/frame.h"
 #include "libavutil/mem_internal.h"
 
 #include "avcodec.h"
+#include "cavs_aec.h"
 #include "cavsdsp.h"
 #include "blockdsp.h"
 #include "h264chroma.h"
@@ -152,6 +154,9 @@ typedef struct cavs_vector {
     int16_t y;
     int16_t dist;
     int16_t ref;
+    /** mb_reference_index of the block, 0 when it codes none (cl. 9.4.5);
+       ref above is where the reference list puts it */
+    int16_t ref_idx;
 } cavs_vector;
 
 struct dec_2dvlc {
@@ -176,8 +181,16 @@ typedef struct AVSContext {
     GetBitContext gb;
     AVSFrame cur;     ///< currently decoded frame
     AVSFrame DPB[2];  ///< reference frames
-    int dist[2];     ///< temporal distances from current frame to ref frames
+    /** The reference of every reference index, cl. 9.4.5: a frame, or the
+       field of one starting at parity; both lists share the array. */
+    struct {
+        AVFrame *f;   ///< frame the reference belongs to
+        int parity;   ///< first line of the reference field inside it
+    } ref[4];
+    int ref_base[2]; ///< first entry of the forward and the backward list
+    int dist[4];     ///< BlockDistance of every reference, cl. 9.4.6.1
     int low_delay;
+    int progressive_seq;
     int profile, level;
     int aspect_ratio;
     int mb_width, mb_height;
@@ -185,7 +198,24 @@ typedef struct AVSContext {
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
     int progressive;
     int pic_structure;
+    int top_field_first; ///< the first coded field is the top one, cl. 7.2.3
+    /** the coded field the current macroblock belongs to, 0 or 1, cl. 3.24 */
+    int field;
+    int field_mby;      ///< macroblock row of the current macroblock in it
     int skip_mode_flag; ///< select between skip_count or one skip_flag per MB
+    int aec_enable;     ///< AVS1-P16 arithmetic coding of the macroblock layer
+    CAVSAECContext aec; ///< AEC engine and context models, cl. 8.4
+    int prev_delta_qp;  ///< PreviousDeltaQP of cl. 9.4.8, an AEC context
+    int left_cbp;       ///< MbCBP of the macroblock to the left
+    uint8_t *top_cbp;   ///< MbCBP of the macroblock above, one per column
+    /** MbType of the macroblock to the left, cl. 8.4.4.2 b) */
+    int left_mb_type;
+    /** MbType of the macroblock above, one per column */
+    uint8_t *top_mb_type;
+    /** IntraChromaPredMode of the macroblock to the left, cl. 8.4.4.2 e) */
+    int left_c_pred_mode;
+    /** IntraChromaPredMode of the macroblock above, one per column */
+    uint8_t *top_c_pred_mode;
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
@@ -209,6 +239,8 @@ typedef struct AVSContext {
 
        the same is repeated for backward motion vectors */
     DECLARE_ALIGNED(8, cavs_vector, mv)[2*4*3];
+    /** mv_diff of the same blocks, for the ctxIdxInc of cl. 8.4.4.2 g) */
+    int16_t mvd[2*4*3][2];
     cavs_vector *top_mv[2];
     cavs_vector *col_mv;
 
@@ -226,6 +258,10 @@ typedef struct AVSContext {
     int cbp;
     DECLARE_ALIGNED(32, int16_t, block)[64];
     uint8_t permutated_scantable[64];
+    /** inverse block scan method 2 of cl. 9.5.3 c), for field pictures */
+    uint8_t permutated_scantable_field[64];
+    /** the one of the two the current picture uses, selected in decode_pic() */
+    const uint8_t *scantable;
 
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */
@@ -238,12 +274,20 @@ typedef struct AVSContext {
     void (*intra_pred_c[7])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
     uint8_t *col_type_base;
 
-    /* scaling factors for MV prediction */
-    int sym_factor;    ///< for scaling in symmetrical B block
-    int direct_den[2]; ///< for scaling in direct B block
-    int scale_den[2];  ///< for scaling neighbouring MVs
+    /** 512 / dist[], for scaling neighbouring MVs (cl. 9.4.6.2 step 3) */
+    int scale_den[4];
 
     uint8_t *edge_emu_buffer;
+
+    /** picture payload with the annex A pseudo start code escapes removed,
+        allocated only for the pictures that carry one */
+    uint8_t *deemulated_buf;
+    unsigned int deemulated_buf_size; ///< allocated size of deemulated_buf
+    /** byte offsets in deemulated_buf at which a start code prefix of the
+        original payload begins; see is_start_code_offset() */
+    uint32_t *stc_offset;
+    unsigned int stc_offset_size; ///< allocated size of stc_offset
+    int nb_stc_offset;            ///< entries of stc_offset in use
 
     int got_keyframe;
 } AVSContext;
@@ -272,6 +316,22 @@ static inline void set_mvs(cavs_vector *mv, enum cavs_block size) {
     }
 }
 
+/** replicate one partition's mv_diff over the 8x8 blocks it covers */
+static inline void set_mvds(int16_t (*mvd)[2], enum cavs_block size) {
+    switch(size) {
+    case BLK_16X16:
+        memcpy(mvd[MV_STRIDE  ], mvd[0], sizeof(*mvd));
+        memcpy(mvd[MV_STRIDE+1], mvd[0], sizeof(*mvd));
+        av_fallthrough;
+    case BLK_16X8:
+        memcpy(mvd[1], mvd[0], sizeof(*mvd));
+        break;
+    case BLK_8X16:
+        memcpy(mvd[MV_STRIDE], mvd[0], sizeof(*mvd));
+        break;
+    }
+}
+
 void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_load_intra_pred_luma(AVSContext *h, uint8_t *top, uint8_t **left,
                                   int block);
@@ -281,6 +341,7 @@ void ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
                 enum cavs_mv_pred mode, enum cavs_block size, int ref);
 void ff_cavs_init_mb(AVSContext *h);
+void ff_cavs_set_mb_row(AVSContext *h);
 int  ff_cavs_next_mb(AVSContext *h);
 int ff_cavs_init_pic(AVSContext *h);
 int ff_cavs_init_top_lines(AVSContext *h);

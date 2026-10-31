@@ -152,7 +152,8 @@ X86ASM-OBJS-$(CONFIG_ALAC_DECODER)     += x86/alacdsp.o
 X86ASM-OBJS-$(CONFIG_APNG_DECODER)     += x86/pngdsp.o
 X86ASM-OBJS-$(CONFIG_APV_DECODER)      += x86/apv_dsp.o
 X86ASM-OBJS-$(CONFIG_BITPACKED_DECODER) += x86/bitpacked.o
-X86ASM-OBJS-$(CONFIG_CAVS_DECODER)     += x86/cavsidct.o x86/cavs_qpel.o
+X86ASM-OBJS-$(CONFIG_CAVS_DECODER)     += x86/cavsidct.o x86/cavs_qpel.o \
+                                          x86/cavs_deblock.o
 X86ASM-OBJS-$(CONFIG_CFHD_ENCODER)     += x86/cfhdencdsp.o
 X86ASM-OBJS-$(CONFIG_CFHD_DECODER)     += x86/cfhddsp.o
 X86ASM-OBJS-$(CONFIG_DCA_DECODER)      += x86/dcadsp.o x86/synth_filter.o

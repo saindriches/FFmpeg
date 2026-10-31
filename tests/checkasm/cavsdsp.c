@@ -21,10 +21,12 @@
 #include <string.h>
 
 #include "checkasm.h"
+#include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/macros.h"
 #include "libavutil/mem_internal.h"
 #include "libavcodec/cavsdsp.h"
+#include "libavcodec/idctdsp.h"
 
 
 enum {
@@ -107,9 +109,138 @@ static void check_cavs_qpeldsp(void)
                     call_new(dst1, src1, stride);
                     if (memcmp(srcbuf0, srcbuf1, sizeof(srcbuf0)) || memcmp(dstbuf0, dstbuf1, sizeof(dstbuf0)))
                         fail();
+                    /*
+                     * The quarter sample filters weight neighbouring
+                     * samples by 96 and 42 against negative taps, so the
+                     * positive tap sum reaches (96 + 42) * 255 = 35190,
+                     * past INT16_MAX, when the positively weighted samples
+                     * are 255 and the negatively weighted ones are 0.  A
+                     * flat 255 source only reaches 255 * 128 = 32640 and
+                     * would miss it, so drive the taps to the extremes
+                     * independently.
+                     */
+                    for (int k = 0; k < (int)sizeof(srcbuf0); k++)
+                        srcbuf0[k] = srcbuf1[k] = (rnd() & 1) ? 0xFF : 0x00;
+                    randomize_buffers(dstbuf0, dstbuf1);
+                    call_ref(dst0, src0, stride);
+                    call_new(dst1, src1, stride);
+                    if (memcmp(srcbuf0, srcbuf1, sizeof(srcbuf0)) || memcmp(dstbuf0, dstbuf1, sizeof(dstbuf0)))
+                        fail();
                     bench_new(dst0, src0, stride);
                 }
             }
+        }
+    }
+}
+
+static void check_cavs_idct8_add(void)
+{
+    DECLARE_ALIGNED(16, int16_t, block0)[64];
+    DECLARE_ALIGNED(16, int16_t, block1)[64];
+    DECLARE_ALIGNED(16, uint8_t, dstbuf0)[8 * 16];
+    DECLARE_ALIGNED(16, uint8_t, dstbuf1)[8 * 16];
+    CAVSDSPContext cavsdsp;
+    declare_func(void, uint8_t *dst, int16_t *block, ptrdiff_t stride);
+
+    ff_cavsdsp_init(&cavsdsp);
+
+    if (check_func(cavsdsp.cavs_idct8_add, "cavs_idct8_add")) {
+        for (int iter = 0; iter < 32; ++iter) {
+            int16_t coef[64] = { 0 };
+            /*
+             * The SIMD implementations work in 16 bit lanes while the C
+             * code computes in int; they agree as long as no intermediate
+             * overflows int16_t. The largest per-coefficient weight of the
+             * 1D transform is 16, so with sum(|coef|) = S every first pass
+             * intermediate is below 16 * S + 132 and, after the >> 3,
+             * every second pass intermediate below 32 * S + 2240. Keeping
+             * S <= 950 bounds them all by 32767, which mirrors the
+             * conformance limits real streams decode under.
+             */
+            int budget = 950;
+
+            while (budget > 0) {
+                int idx = rnd() % 64;
+                int v   = (int)(rnd() % (2 * budget + 1)) - budget;
+
+                coef[idx] += v;
+                budget    -= FFMAX(FFABS(v), 1);
+            }
+
+            /* each implementation reads the block in its scan permutation */
+            for (int i = 0; i < 8; ++i)
+                for (int j = 0; j < 8; ++j) {
+                    block0[8 * i + j] = coef[8 * i + j];
+                    if (cavsdsp.idct_perm == FF_IDCT_PERM_TRANSPOSE)
+                        block1[8 * j + i] = coef[8 * i + j];
+                    else
+                        block1[8 * i + j] = coef[8 * i + j];
+                }
+
+            randomize_buffers(dstbuf0, dstbuf1);
+            call_ref(dstbuf0, block0, 16);
+            call_new(dstbuf1, block1, 16);
+            /* the block is caller cleared scratch, only the dst counts */
+            if (memcmp(dstbuf0, dstbuf1, sizeof(dstbuf0)))
+                fail();
+        }
+        bench_new(dstbuf1, block1, 16);
+    }
+}
+
+static void check_cavs_loop_filter(void)
+{
+    /* 24 rows of 32; the edge sample sits at (8, 8) so that both the
+     * vertical (16 rows, cols -4..3) and the horizontal (rows -3..2,
+     * 16 cols) geometry stay inside the buffer */
+    DECLARE_ALIGNED(16, uint8_t, buf0)[24 * 32];
+    DECLARE_ALIGNED(16, uint8_t, buf1)[24 * 32];
+    CAVSDSPContext cavsdsp;
+    static const struct {
+        const char *name;
+        size_t offset;
+    } tests[] = {
+        TEST(cavs_filter_lv),
+        TEST(cavs_filter_lh),
+        TEST(cavs_filter_cv),
+        TEST(cavs_filter_ch),
+    };
+    /* every (bs1, bs2) shape ff_cavs_filter() produces */
+    static const int8_t bs_pairs[][2] = {
+        { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 }, { 2, 2 },
+    };
+    declare_func(void, uint8_t *d, ptrdiff_t stride, int alpha, int beta,
+                 int tc, int bs1, int bs2);
+
+    ff_cavsdsp_init(&cavsdsp);
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(tests); ++i) {
+        void (*func)(uint8_t *, ptrdiff_t, int, int, int, int, int) =
+            *(void (*const *)(uint8_t *, ptrdiff_t, int, int, int, int, int))
+                ((const char *)&cavsdsp + tests[i].offset);
+
+        if (check_func(func, "%s", tests[i].name)) {
+            for (size_t bs = 0; bs < FF_ARRAY_ELEMS(bs_pairs); ++bs) {
+                for (int iter = 0; iter < 8; ++iter) {
+                    /* the table ranges: alpha 0..64, beta 0..27, tc 0..9 */
+                    int alpha = rnd() % 65;
+                    int beta  = rnd() % 28;
+                    int tc    = rnd() % 10;
+
+                    randomize_buffers(buf0, buf1);
+                    /* low deltas often, so the filter conditions do fire */
+                    if (iter & 1)
+                        for (size_t k = 0; k < sizeof(buf0); ++k)
+                            buf1[k] = buf0[k] = 128 + (buf0[k] & 15);
+                    call_ref(buf0 + 8 * 32 + 8, 32, alpha, beta, tc,
+                             bs_pairs[bs][0], bs_pairs[bs][1]);
+                    call_new(buf1 + 8 * 32 + 8, 32, alpha, beta, tc,
+                             bs_pairs[bs][0], bs_pairs[bs][1]);
+                    if (memcmp(buf0, buf1, sizeof(buf0)))
+                        fail();
+                }
+            }
+            bench_new(buf1 + 8 * 32 + 8, 32, 40, 20, 4, 2, 2);
         }
     }
 }
@@ -118,4 +249,8 @@ void checkasm_check_cavsdsp(void)
 {
     check_cavs_qpeldsp();
     report("qpeldsp");
+    check_cavs_idct8_add();
+    report("idct8");
+    check_cavs_loop_filter();
+    report("loop_filter");
 }
