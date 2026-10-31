@@ -73,6 +73,23 @@ ASTC (Adaptive Scalable Texture Compression) demuxer.
 This demuxer reads the 16-byte @file{.astc} header, hands it to the decoder as
 extradata, and emits the compressed image as a single packet.
 
+@section bt1869_tlv
+
+ITU-R BT.1869 TLV multiplexing demuxer, also specified as ARIB STD-B32. It
+reads the TLV streams of Japanese 4K and 8K satellite broadcasting.
+Recordings are commonly named @file{.mmts}, a naming convention rather than
+part of either standard.
+
+TLV packets carry IPv4, IPv6 and header compressed IP packets. In these
+broadcasts the UDP payloads are MMTP packets (ISO/IEC 23008-1), and each UDP
+flow that carries MMTP becomes a program. Streams, timestamps and languages
+come from the ARIB STD-B60 signalling: the MMT package table and the MPU
+timestamp descriptors.
+
+HEVC video and AAC audio in LATM are read; the AAC frames get LOAS headers.
+IPv4 packets with compressed headers, MMTP version 1 packets (the QoS
+header), FEC repair packets and scrambled payloads are skipped.
+
 @anchor{concat}
 @section concat
 

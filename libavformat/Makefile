@@ -44,6 +44,7 @@ OBJS-$(HAVE_LIBC_MSVCRT)                 += file_open.o
 
 # subsystems
 include $(SRC_PATH)/libavformat/id3v2/Makefile
+include $(SRC_PATH)/libavformat/mmtp/Makefile
 include $(SRC_PATH)/libavformat/ogg/Makefile
 include $(SRC_PATH)/libavformat/vorbis/comment/Makefile
 OBJS-$(CONFIG_CBS_APV_LAVF)              += cbs_apv.o cbs.o
@@ -175,6 +176,7 @@ OBJS-$(CONFIG_BOA_DEMUXER)               += boadec.o
 OBJS-$(CONFIG_BONK_DEMUXER)              += bonk.o rawdec.o
 OBJS-$(CONFIG_BFSTM_DEMUXER)             += brstm.o
 OBJS-$(CONFIG_BRSTM_DEMUXER)             += brstm.o
+OBJS-$(CONFIG_BT1869_TLV_DEMUXER)        += bt1869_tlvdec.o mmtp/reader.o mmtp/arib.o
 OBJS-$(CONFIG_C93_DEMUXER)               += c93.o voc_packet.o voc.o
 OBJS-$(CONFIG_CAF_DEMUXER)               += cafdec.o caf.o mov_chan.o mov_esds.o
 OBJS-$(CONFIG_CAF_MUXER)                 += cafenc.o caf.o riff.o
