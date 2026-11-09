@@ -34,6 +34,7 @@
 #include "avcodec.h"
 #include "get_bits.h"
 #include "golomb.h"
+#include "idctdsp.h"
 #include "cavs.h"
 #include "codec_internal.h"
 #include "profiles.h"
@@ -584,8 +585,15 @@ static inline int get_ue_code(GetBitContext *gb, int order)
     return ret;
 }
 
-static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
-                          int16_t *dst, int mul, int shift, int coeff_num)
+/**
+ * Inverse scan and dequantize the level/run pairs of one block into dst.
+ * @param weighted scale by WeightingQuantMatrix8x8 as well; a constant in
+ *                 both callers, so each gets its own loop
+ */
+static av_always_inline int dequant_internal(AVSContext *h, int16_t *level_buf,
+                                            uint8_t *run_buf, int16_t *dst,
+                                            int mul, int shift, int coeff_num,
+                                            int weighted)
 {
     int round = 1 << (shift - 1);
     int pos = -1;
@@ -600,9 +608,27 @@ static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
                    h->cur.poc, h->mbx, h->mby);
             return AVERROR_INVALIDDATA;
         }
-        dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
+        if (weighted) {
+            /* scale by WeightingQuantMatrix8x8 first (9.6.2); c * mul
+             * exceeds 32 bits even for conformant coefficients
+             */
+            int64_t c = level_buf[coeff_num] * h->wq_matrix[scantab[pos]] >> 3;
+            dst[scantab[pos]] = ((c * mul >> 4) + round) >> shift;
+        } else {
+            dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
+        }
     }
     return 0;
+}
+
+static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
+                          int16_t *dst, int mul, int shift, int coeff_num)
+{
+    if (h->weighting_quant)
+        return dequant_internal(h, level_buf, run_buf, dst, mul, shift,
+                                coeff_num, 1);
+    return dequant_internal(h, level_buf, run_buf, dst, mul, shift,
+                            coeff_num, 0);
 }
 
 /**
@@ -1867,6 +1893,101 @@ static int set_ref_list(AVSContext *h)
     return 0;
 }
 
+/**
+ * Read the weighted quantization parameters of a picture header (tables 21
+ * and 22) and build WeightingQuantMatrix8x8 (9.2, 9.4.9).
+ */
+static int decode_weighting_quant(AVSContext *h)
+{
+    /* WeightingQuantParamDefault, WeightingQuantParamBase1 and
+     * WeightingQuantParamBase2 (9.2): the bases of wqP[0], wqP[1] and wqP[2]
+     */
+    static const uint8_t wq_param[3][6] = {
+        { 128,  98, 106, 116, 116, 128 },
+        { 135, 143, 143, 160, 160, 213 },
+        { 128,  98, 106, 116, 116, 128 },
+    };
+    /* wqM8x8 of the three models (9.2 c)), as indices into wqP. The figures
+     * of 9.5 print the column number i across and the row number j down,
+     * so these are read the same way: raster order of the block.
+     */
+    static const uint8_t wq_model[3][64] = {
+        {
+            0, 0, 0, 4, 4, 4, 5, 5,
+            0, 0, 3, 3, 3, 3, 5, 5,
+            0, 3, 2, 2, 1, 1, 5, 5,
+            4, 3, 2, 2, 1, 5, 5, 5,
+            4, 3, 1, 1, 5, 5, 5, 5,
+            4, 3, 1, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+        }, {
+            0, 0, 0, 4, 4, 4, 5, 5,
+            0, 0, 4, 4, 4, 4, 5, 5,
+            0, 3, 2, 2, 2, 1, 5, 5,
+            3, 3, 2, 2, 1, 5, 5, 5,
+            3, 3, 2, 1, 5, 5, 5, 5,
+            3, 3, 1, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+        }, {
+            0, 0, 0, 4, 4, 3, 5, 5,
+            0, 0, 4, 4, 3, 2, 5, 5,
+            0, 4, 4, 3, 2, 1, 5, 5,
+            4, 4, 3, 2, 1, 5, 5, 5,
+            4, 3, 2, 1, 5, 5, 5, 5,
+            3, 2, 1, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+        },
+    };
+    GetBitContext *gb = &h->gb;
+    uint8_t permutation[64];
+    uint8_t param[6];
+    int index, model;
+
+    skip_bits1(gb);                     //reserved_bits
+    if (!get_bits1(gb)) {               //chroma_quant_param_disable
+        for (int i = 0; i < 2; i++) {
+            int delta = get_se_golomb(gb);
+            if (delta < -16 || delta > 16) {
+                av_log(h->avctx, AV_LOG_ERROR,
+                       "chroma_quant_param_delta %d out of range\n", delta);
+                return AVERROR_INVALIDDATA;
+            }
+            h->chroma_qp_delta[i] = delta;
+        }
+    }
+    index = get_bits(gb, 2);            //weighting_quant_param_index
+    model = get_bits(gb, 2);            //weighting_quant_model
+    if (index == 3 || model == 3) {
+        av_log(h->avctx, AV_LOG_ERROR,
+               "weighting_quant_param_index %d or weighting_quant_model %d "
+               "is reserved\n", index, model);
+        return AVERROR_INVALIDDATA;
+    }
+    /* wqP[index]; only that set is used (9.4.9) */
+    memcpy(param, wq_param[index], sizeof(param));
+    if (index) {
+        for (int i = 0; i < 6; i++) {
+            int delta = get_se_golomb(gb);
+            if (delta < -param[i] || delta > 255 - param[i]) {
+                av_log(h->avctx, AV_LOG_ERROR,
+                       "weighting_quant_param_delta %d out of range\n", delta);
+                return AVERROR_INVALIDDATA;
+            }
+            param[i] += delta;
+        }
+    }
+    if (get_bits_left(gb) < 0)
+        return AVERROR_INVALIDDATA;
+
+    ff_init_scantable_permutation(permutation, h->cdsp.idct_perm);
+    for (int i = 0; i < 64; i++)
+        h->wq_matrix[permutation[i]] = param[wq_model[model][i]];
+    return 0;
+}
+
 static int decode_pic(AVSContext *h)
 {
     int ret;
@@ -1988,10 +2109,14 @@ static int decode_pic(AVSContext *h)
 
     /* AWQ parameters and aec_enable end the header (tables 21, 22) */
     h->aec_enable = 0;
+    h->weighting_quant = 0;
+    h->chroma_qp_delta[0] = h->chroma_qp_delta[1] = 0;
     if (h->profile == AV_PROFILE_CAVS_BROADCASTING) {
-        if (get_bits1(&h->gb)) { //weighting_quant_flag
-            avpriv_request_sample(h->avctx, "Adaptive weighted quantization");
-            return AVERROR_PATCHWELCOME;
+        h->weighting_quant = get_bits1(&h->gb);
+        if (h->weighting_quant) {
+            ret = decode_weighting_quant(h);
+            if (ret < 0)
+                return ret;
         }
         h->aec_enable = get_bits1(&h->gb);
     }

@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "libavutil/attributes.h"
+#include "libavutil/common.h"
 #include "libavutil/frame.h"
 #include "libavutil/mem_internal.h"
 
@@ -220,7 +221,9 @@ typedef struct AVSContext {
     uint8_t *top_c_pred_mode;  ///< IntraChromaPredMode above, per column
     int loop_filter_disable;
     int alpha_offset, beta_offset;
+    int weighting_quant;    ///< weighting_quant_flag of the picture
     int chroma_qp_delta[2]; ///< chroma_quant_param_delta of Cb and Cr
+    uint8_t wq_matrix[64];  ///< WeightingQuantMatrix8x8 (9.4.9), IDCT order
     int ref_flag;
     int mbx, mby, mbidx; ///< macroblock coordinates
     int flags;         ///< availability flags of neighbouring macroblocks
@@ -311,11 +314,12 @@ extern const uint8_t     ff_cavs_partition_flags[30];
 
 /**
  * Chroma quantization parameter (9.6.1): table 61 indexed by CurrentQP plus
- * the picture's chroma delta for @p plane (0 Cb, 1 Cr).
+ * the picture's chroma delta for @p plane (0 Cb, 1 Cr). The standard keeps
+ * the index in 0..63, but some streams exceed it, so clip.
  */
 static inline int ff_cavs_chroma_qp_of(const AVSContext *h, int qp, int plane)
 {
-    return ff_cavs_chroma_qp[qp + h->chroma_qp_delta[plane]];
+    return ff_cavs_chroma_qp[av_clip(qp + h->chroma_qp_delta[plane], 0, 63)];
 }
 
 /** mark block as using intra prediction */
