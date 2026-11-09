@@ -220,6 +220,7 @@ typedef struct AVSContext {
     uint8_t *top_c_pred_mode;  ///< IntraChromaPredMode above, per column
     int loop_filter_disable;
     int alpha_offset, beta_offset;
+    int chroma_qp_delta[2]; ///< chroma_quant_param_delta of Cb and Cr
     int ref_flag;
     int mbx, mby, mbidx; ///< macroblock coordinates
     int flags;         ///< availability flags of neighbouring macroblocks
@@ -307,6 +308,15 @@ typedef struct AVSContext {
 
 extern const uint8_t     ff_cavs_chroma_qp[64];
 extern const uint8_t     ff_cavs_partition_flags[30];
+
+/**
+ * Chroma quantization parameter (9.6.1): table 61 indexed by CurrentQP plus
+ * the picture's chroma delta for @p plane (0 Cb, 1 Cr).
+ */
+static inline int ff_cavs_chroma_qp_of(const AVSContext *h, int qp, int plane)
+{
+    return ff_cavs_chroma_qp[qp + h->chroma_qp_delta[plane]];
+}
 
 /** mark block as using intra prediction */
 #define CAVS_DIR_MV   (cavs_vector){ 0, 0, 1, REF_DIR, 0 }

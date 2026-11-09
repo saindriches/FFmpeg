@@ -1147,16 +1147,17 @@ static int decode_residual(AVSContext *h, const struct dec_2dvlc *r,
 
 static inline int decode_residual_chroma(AVSContext *h)
 {
-    const int qp = ff_cavs_chroma_qp[h->qp];
+    const int qp_cb = ff_cavs_chroma_qp_of(h, h->qp, 0);
+    const int qp_cr = ff_cavs_chroma_qp_of(h, h->qp, 1);
     int ret;
 
     if (h->cbp & (1 << 4)) {
-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cu, h->c_stride);
+        ret = decode_residual(h, chroma_dec, 0, 1, qp_cb, h->cu, h->c_stride);
         if (ret < 0)
             return ret;
     }
     if (h->cbp & (1 << 5)) {
-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cv, h->c_stride);
+        ret = decode_residual(h, chroma_dec, 0, 1, qp_cr, h->cv, h->c_stride);
         if (ret < 0)
             return ret;
     }

@@ -106,6 +106,16 @@ static inline int get_bs(cavs_vector *mvP, cavs_vector *mvQ, int b)
     tc    =    tc_tab[av_clip_uintp2(qp_avg + h->alpha_offset, 6)];
 
 /**
+ * Average of the chroma QPs of the current block and a neighbour for the
+ * chroma edge between them (9.11).
+ */
+static inline int chroma_qp_avg(const AVSContext *h, int qp_nb, int plane)
+{
+    return (ff_cavs_chroma_qp_of(h, h->qp, plane) +
+            ff_cavs_chroma_qp_of(h, qp_nb, plane) + 1) >> 1;
+}
+
+/**
  * in-loop deblocking filter for a single macroblock
  *
  * boundary strength (bs) mapping:
@@ -159,9 +169,13 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 qp_avg = (h->qp + h->left_qp + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_lv(h->cy, h->l_stride, alpha, beta, tc, bs[0], bs[1]);
-                qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->left_qp] + 1) >> 1;
+                qp_avg = chroma_qp_avg(h, h->left_qp, 0);
                 SET_PARAMS;
                 h->cdsp.cavs_filter_cv(h->cu, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
+                if (h->chroma_qp_delta[0] != h->chroma_qp_delta[1]) {
+                    qp_avg = chroma_qp_avg(h, h->left_qp, 1);
+                    SET_PARAMS;
+                }
                 h->cdsp.cavs_filter_cv(h->cv, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
             }
             qp_avg = h->qp;
@@ -173,9 +187,13 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 qp_avg = (h->qp + h->top_qp[h->mbx] + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_lh(h->cy, h->l_stride, alpha, beta, tc, bs[4], bs[5]);
-                qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->top_qp[h->mbx]] + 1) >> 1;
+                qp_avg = chroma_qp_avg(h, h->top_qp[h->mbx], 0);
                 SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cu, h->c_stride, alpha, beta, tc, bs[4], bs[5]);
+                if (h->chroma_qp_delta[0] != h->chroma_qp_delta[1]) {
+                    qp_avg = chroma_qp_avg(h, h->top_qp[h->mbx], 1);
+                    SET_PARAMS;
+                }
                 h->cdsp.cavs_filter_ch(h->cv, h->c_stride, alpha, beta, tc, bs[4], bs[5]);
             }
         }
