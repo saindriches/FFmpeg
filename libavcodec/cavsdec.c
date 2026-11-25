@@ -1900,18 +1900,21 @@ static int set_ref_list(AVSContext *h)
 static int decode_weighting_quant(AVSContext *h)
 {
     /* WeightingQuantParamDefault, WeightingQuantParamBase1 and
-     * WeightingQuantParamBase2 (9.2): the bases of wqP[0], wqP[1] and wqP[2]
+     * WeightingQuantParamBase2 (9.2): the bases of wqP[0], wqP[1] and wqP[2].
+     * The fourth set is for the reserved index 3, see below.
      */
-    static const uint8_t wq_param[3][6] = {
+    static const uint8_t wq_param[4][6] = {
         { 128,  98, 106, 116, 116, 128 },
         { 135, 143, 143, 160, 160, 213 },
         { 128,  98, 106, 116, 116, 128 },
+        { 128, 128, 128, 128, 128, 128 },
     };
     /* wqM8x8 of the three models (9.2 c)), as indices into wqP. The figures
      * of 9.5 print the column number i across and the row number j down,
      * so these are read the same way: raster order of the block.
+     * The fourth layout is for the reserved model 3, see below.
      */
-    static const uint8_t wq_model[3][64] = {
+    static const uint8_t wq_model[4][64] = {
         {
             0, 0, 0, 4, 4, 4, 5, 5,
             0, 0, 3, 3, 3, 3, 5, 5,
@@ -1939,6 +1942,15 @@ static int decode_weighting_quant(AVSContext *h)
             3, 2, 1, 5, 5, 5, 5, 5,
             5, 5, 5, 5, 5, 5, 5, 5,
             5, 5, 5, 5, 5, 5, 5, 5,
+        }, {
+            0, 0, 0, 3, 2, 1, 5, 5,
+            0, 0, 4, 3, 2, 1, 5, 5,
+            0, 4, 4, 3, 2, 1, 5, 5,
+            3, 3, 3, 3, 2, 5, 5, 5,
+            2, 2, 2, 2, 5, 5, 5, 5,
+            1, 1, 1, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5,
         },
     };
     GetBitContext *gb = &h->gb;
@@ -1960,15 +1972,13 @@ static int decode_weighting_quant(AVSContext *h)
     }
     index = get_bits(gb, 2);            //weighting_quant_param_index
     model = get_bits(gb, 2);            //weighting_quant_model
-    if (index == 3 || model == 3) {
-        av_log(h->avctx, AV_LOG_ERROR,
-               "weighting_quant_param_index %d or weighting_quant_model %d "
-               "is reserved\n", index, model);
-        return AVERROR_INVALIDDATA;
-    }
+    /* GY/T 257.1 reserves index 3 and model 3 (7.2.3.1). They are decoded
+     * as the GDM reference decoder is reported to: index 3 is a flat set
+     * without deltas, model 3 a fourth layout.
+     */
     /* wqP[index]; only that set is used (9.4.9) */
     memcpy(param, wq_param[index], sizeof(param));
-    if (index) {
+    if (index == 1 || index == 2) {
         for (int i = 0; i < 6; i++) {
             int delta = get_se_golomb(gb);
             if (delta < -param[i] || delta > 255 - param[i]) {
